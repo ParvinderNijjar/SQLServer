@@ -1,0 +1,36 @@
+-- table compression (page)  
+
+--Run the first statement and copy the output to a new window and execute it.
+
+select distinct 'Alter table [' + s.name  + '].[' +  o.name  + '] Rebuild Partition = All  with (data_compression = page,online = off) --Rows ' + CAST(p.rows as varchar(20))
+      from sys.partitions  p
+join sys.objects o
+      on p.object_id = o.object_id 
+join sys.schemas s
+          on o.schema_id = s.schema_id
+where data_compression_desc  = 'none'
+and o.type = 'U'
+and o.name is not null
+and p.partition_number = 1
+
+
+--once the first script is complete execute the following.  Copy the output to a new window and execute it.
+
+select 'Alter index [' +  i.name  + '] on [' + s.name  + '].[' + o.name + '] Rebuild Partition = All  with (data_compression = page,online = off) --Rows ' + CAST(p.rows as varchar(20))
+      from sys.partitions  p
+join sys.objects o
+      on p.object_id = o.object_id
+join sys.schemas s
+          on o.schema_id = s.schema_id
+join sys.indexes i
+      on i.object_id = p.object_id
+      and i.index_id = p.index_id   
+where data_compression_desc  = 'none'
+and o.type = 'U'
+and i.name is not null
+and o.name is not null
+and p.partition_number = 1
+
+-- once both sets of output have been run you can then rerun both the above statements to comfirm that no non compressed object exist.
+
+

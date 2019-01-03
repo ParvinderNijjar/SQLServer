@@ -1,0 +1,170 @@
+SET NOCOUNT ON;
+
+
+CREATE TABLE #final_results(
+ [database_name] sysname
+ ,[vlf_count] INT
+ ,[log_file_count] INT
+ ,[log_file_name] varchar(250)
+ ,[log_size_mb] numeric(15)
+ ,[log_growthsize_mb] numeric(15)
+ ,[truncate_log_file] varchar(1000)
+ ,[set_log_file_size_and_growth] nvarchar(1000)
+);
+
+
+CREATE TABLE #results(
+key_col int NOT NULL IDENTITY (1,1)
+ ,[database_name] sysname
+ ,[vlf_count] INT
+ ,[log_file_count] INT
+ ,[log_file_name] varchar(250)
+ ,[log_size_mb] numeric(15,1)
+ ,[log_growthsize_mb] numeric(15,1)
+);
+
+CREATE TABLE #stage(
+ [file_id] INT
+ ,[file_size] BIGINT
+ ,[start_offset] BIGINT
+ ,[f_seq_no] BIGINT
+ ,[status] BIGINT
+ ,[parity] BIGINT
+ ,[create_lsn] NUMERIC(38)
+);
+
+
+DECLARE csr_db CURSOR FAST_FORWARD READ_ONLY FOR
+  SELECT [name]
+ FROM master.sys.sysdatabases
+WHERE STATUS NOT IN (528, 66048);
+-- OFFLINE = 528
+
+DECLARE @dbname nvarchar(128);
+
+OPEN csr_db;
+FETCH NEXT FROM csr_db INTO @dbname;
+
+WHILE (@@fetch_status <> -1)
+BEGIN
+ INSERT INTO #stage
+ EXECUTE (N'DBCC LogInfo([' + @dbname + N']) WITH no_infomsgs');
+
+ INSERT INTO #results
+ SELECT
+  @dbname
+  ,COUNT(*)
+  ,COUNT(DISTINCT [file_id])
+,(SELECT MAX([master_files].[name])
+   FROM master.sys.master_files
+   INNER JOIN master.sys.databases
+   ON master.sys.master_files.database_id = master.sys.databases.database_id
+   WHERE [master_files].[type_desc]=N'LOG' AND [databases].[name]=@dbname)
+  ,(SELECT SUM([size]*8/1024.)
+   FROM master.sys.master_files
+   INNER JOIN master.sys.databases
+   ON master.sys.master_files.database_id = master.sys.databases.database_id
+   WHERE [master_files].[type_desc]=N'LOG' AND [databases].[name]=@dbname)
+   ,(SELECT SUM([growth]*8/1024.)
+   FROM master.sys.master_files
+   INNER JOIN master.sys.databases
+   ON master.sys.master_files.database_id = master.sys.databases.database_id
+   WHERE [master_files].[type_desc]=N'LOG' AND [databases].[name]=@dbname)
+   	
+ FROM #stage;
+
+--SELECT * FROM #stage;
+
+ TRUNCATE TABLE #stage;
+
+ FETCH NEXT FROM csr_db INTO @dbname;
+END
+
+CLOSE csr_db;
+DEALLOCATE csr_db;
+
+DROP TABLE #stage;
+
+--select * from #results
+--ORDER BY vlf_count DESC
+
+
+DECLARE @Id INT
+
+	WHILE (SELECT COUNT(*) FROM #results) > 0 
+
+		BEGIN
+			 
+			SELECT TOP 1 @Id = key_col FROM #results 
+				
+				DECLARE @DB_Name sysname
+				DECLARE @vlf_count INT
+				DECLARE @log_file_count INT
+				DECLARE @log_file_name varchar(250)
+				DECLARE	@log_size_mb numeric(15)
+				DECLARE	@newlog_size_mb numeric(15)
+				DECLARE @log_growthsize_mb numeric(15)
+				DECLARE @truncate_log_file varchar(1000)
+				DECLARE @set_log_file_size_and_growth nvarchar(1000)
+
+
+				SET @DB_Name = (SELECT database_name FROM #results where key_col = @Id)
+				SET @vlf_count = (SELECT vlf_count FROM #results where key_col = @Id)
+				SET @log_file_count = (SELECT log_file_count FROM #results where key_col = @Id)
+				SET @log_file_name = (SELECT log_file_name FROM #results where key_col = @Id)
+				SET @log_size_mb = (SELECT log_size_mb FROM #results where key_col = @Id)
+				SET @log_growthsize_mb = (SELECT log_growthsize_mb FROM #results where key_col = @Id)
+
+				IF @log_size_mb < 1 
+				SET @log_size_mb = 1
+
+				IF @log_growthsize_mb < 1 
+				SET @log_growthsize_mb = 1
+
+				SET @truncate_log_file = 'USE [' + @DB_Name + '] DBCC SHRINKFILE (''' + @log_file_name + ''', TRUNCATEONLY)'
+					
+				IF @log_size_mb > 4000
+				BEGIN
+					SET @set_log_file_size_and_growth =
+					'USE [MASTER] ALTER DATABASE ['  + @DB_Name + '] MODIFY FILE ( NAME = N''' + @log_file_name + ''', SIZE = ' +  CAST(@log_size_mb AS nvarchar (19)) + 'MB, FILEGROWTH = 1024MB)'
+
+				END	
+				ELSE
+				BEGIN
+					
+					IF @log_size_mb < 128
+						BEGIN
+								SET @newlog_size_mb = 128
+								SET @set_log_file_size_and_growth =
+								'USE [MASTER] ALTER DATABASE ['  + @DB_Name + '] MODIFY FILE ( NAME = N''' + @log_file_name + ''', SIZE = ' + CAST(@newlog_size_mb AS nvarchar (19)) + 'MB, FILEGROWTH = 128MB)'
+						END
+					ELSE
+						BEGIN		 
+
+								SET @set_log_file_size_and_growth =
+								'USE [MASTER] ALTER DATABASE ['  + @DB_Name + '] MODIFY FILE ( NAME = N''' + @log_file_name + ''', SIZE = ' + CAST(@log_size_mb AS nvarchar (19)) + 'MB, FILEGROWTH = 512MB)'
+						END
+			
+				END	
+
+				PRINT @truncate_log_file
+				PRINT @set_log_file_size_and_growth
+				PRINT ''
+
+				INSERT INTO #final_results 
+				VALUES (@DB_Name, @vlf_count, @log_file_count, @log_file_name, @log_size_mb, @log_growthsize_mb , @truncate_log_file, @set_log_file_size_and_growth)
+
+
+
+			DELETE #results WHERE key_col = @Id
+
+		END
+
+
+
+SELECT * FROM #final_results
+ORDER BY vlf_count DESC
+
+
+DROP TABLE #results
+DROP TABLE #final_results

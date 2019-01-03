@@ -1,0 +1,8 @@
+select @@SERVERNAME ,s.name,l.name
+from  msdb..sysjobs s 
+left join master.sys.syslogins l on s.owner_sid = l.sid
+order by s.name
+
+
+--USE msdb 
+--SELECT @@servername, name FROM sysjobs

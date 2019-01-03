@@ -1,0 +1,3 @@
+SELECT TOP(1) c.local_net_address
+FROM sys.dm_exec_connections AS c
+WHERE c.local_net_address IS NOT NULL;

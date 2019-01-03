@@ -1,0 +1,29 @@
+SELECT
+   U.UserName AS SubscriptionOwner,
+   C.Path AS ReportPath,
+   CONVERT(XML,S.ExtensionSettings) AS SubscriptionSettings,
+   S.EventType AS SubscriptionType,
+   CONVERT(XML,S.Parameters) AS ReportParameters,
+   S.DeliveryExtension AS DeliveryMethod,
+   Sc.Name AS ScheduleName,
+   Rs.ScheduleID
+FROM
+   Subscriptions S
+INNER JOIN
+   Users U
+ON
+   S.OwnerID = U.UserID
+INNER JOIN
+   Catalog C
+ON
+   S.Report_OID = C.ItemID
+INNER JOIN
+   ReportSchedule RS
+ON
+   S.SubscriptionID = RS.SubscriptionID
+INNER JOIN
+   Schedule Sc
+ON
+   RS.ScheduleID = Sc.ScheduleID
+ORDER BY
+   1,2

@@ -1,0 +1,15 @@
+SELECT
+A.name,
+CASE
+    WHEN B.mirroring_state is NULL THEN 'Mirroring not configured'
+    ELSE 'Mirroring configured'
+END as MirroringState
+FROM
+sys.databases A
+INNER JOIN sys.database_mirroring B
+ON A.database_id=B.database_id
+WHERE a.database_id > 4
+ORDER BY A.NAME
+
+
+-- Read more: http://www.sqldbadiaries.com/2011/02/17/script-to-check-if-the-databases-are-configured-for-mirroring/#ixzz2j7f2WoLG

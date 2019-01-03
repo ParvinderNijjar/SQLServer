@@ -1,0 +1,8 @@
+EXEC sp_readerrorlog 1, 1, 'login failed' 
+EXEC sp_readerrorlog 1, 1, 'packet' 
+EXEC sp_readerrorlog 2, 1, 'login failed' 
+EXEC sp_readerrorlog 2, 1, 'packet' 
+EXEC sp_readerrorlog 3, 1, 'login failed' 
+EXEC sp_readerrorlog 3, 1, 'packet' 
+EXEC sp_readerrorlog 4, 1, 'login failed' 
+EXEC sp_readerrorlog 4, 1, 'packet' 

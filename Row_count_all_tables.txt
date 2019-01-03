@@ -1,0 +1,7 @@
+declare @stats table (n sysname, c int)
+insert into @stats
+    exec sp_msforeachtable 'select parsename(''?'', 1),  count(*) from ?'
+select 
+    * 
+from @stats
+order by c desc

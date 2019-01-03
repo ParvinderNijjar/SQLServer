@@ -1,0 +1,8 @@
+declare  @mirroring  table (query varchar(200)) 
+insert into  @mirroring 
+select 'use master;' 
+insert into  @mirroring 
+SELECT ' ALTER DATABASE '+quotename(db_name(database_id))+' SET PARTNER FAILOVER ;'   
+FROM sys.database_mirroring WHERE 
+mirroring_role_desc = 'PRINCIPAL' 
+select * from @mirroring 
