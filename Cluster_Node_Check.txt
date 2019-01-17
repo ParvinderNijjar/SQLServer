@@ -3,46 +3,15 @@
 
 select getdate()
 
-:CONNECT EPCLPRDSQLM3025\Penserver
+:CONNECT SQLBOX01\SQLinstance1
 SELECT @@SERVERNAME, ServerProperty('ComputerNamePhysicalNetBIOS');
 GO
 
-:CONNECT EPCLPRDSQLM3026\COMPENDIA66
+
+:CONNECT SQLBOX02\SQLinstance2
 SELECT @@SERVERNAME, ServerProperty('ComputerNamePhysicalNetBIOS');
 GO
 
-:CONNECT EPCLPRDSQLM3027\COMPENDIA67
-SELECT @@SERVERNAME, ServerProperty('ComputerNamePhysicalNetBIOS');
-GO
-
-:CONNECT EPCLPRDSQLM3028\XafinityPROD
-SELECT @@SERVERNAME, ServerProperty('ComputerNamePhysicalNetBIOS') ;
-GO
-
-:CONNECT EPCLPRDSQLM3029\Dream_Live
-SELECT @@SERVERNAME, ServerProperty('ComputerNamePhysicalNetBIOS')  ;
-GO
-
-:CONNECT EPCLPRDSQLM3030\WMS
-SELECT @@SERVERNAME, ServerProperty('ComputerNamePhysicalNetBIOS')  ;
-GO
-
-:CONNECT EPCLPRDSQLM3031\ITS
-SELECT @@SERVERNAME, ServerProperty('ComputerNamePhysicalNetBIOS')  ;
-GO
-
-:CONNECT EPCLPRDSQLM3035\COMPENDIA
-SELECT @@SERVERNAME, ServerProperty('ComputerNamePhysicalNetBIOS')  ;
-GO
-
-
-:CONNECT EPCLPRDSQLM3036\SAFE
-SELECT @@SERVERNAME, ServerProperty('ComputerNamePhysicalNetBIOS')  ;
-GO
-
-:CONNECT EPCLPRDSQLM3037\XAFINITYPROD
-SELECT @@SERVERNAME, ServerProperty('ComputerNamePhysicalNetBIOS')  ;
-GO
 
 
 -- needs SQLCMD mode on
