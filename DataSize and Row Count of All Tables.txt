@@ -1,4 +1,4 @@
---USE ATPUAT67
+--USE ExampleDB
 GO
 CREATE TABLE #temp (
 table_name sysname ,
