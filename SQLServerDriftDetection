@@ -1,0 +1,124 @@
+Step 1: Create Tables for Baseline and Drift Logging
+
+We’ll store the full baseline from sys.configurations and log any changes.
+sql
+-- Baseline table for all sys.configurations settings
+CREATE TABLE dbo.ConfigBaseline (
+    ConfigurationID INT,
+    SettingName NVARCHAR(128),
+    ExpectedValue SQL_VARIANT,
+    ExpectedValueInUse SQL_VARIANT,
+    Description NVARCHAR(512),
+    PRIMARY KEY (ConfigurationID)
+);
+
+-- Drift log table
+CREATE TABLE dbo.ConfigDriftLog (
+    LogID INT IDENTITY(1,1),
+    DriftDate DATETIME DEFAULT GETDATE(),
+    ConfigurationID INT,
+    SettingName NVARCHAR(128),
+    ExpectedValue SQL_VARIANT,
+    CurrentValue SQL_VARIANT,
+    PRIMARY KEY (LogID)
+);
+
+-- Populate the baseline with current sys.configurations data
+INSERT INTO dbo.ConfigBaseline (ConfigurationID, SettingName, ExpectedValue, ExpectedValueInUse, Description)
+SELECT 
+    configuration_id,
+    name,
+    value,
+    value_in_use,
+    description
+FROM sys.configurations;
+
+Run this once to capture your initial baseline. If you want a specific "desired" state instead of the current state, you’d need to manually adjust ExpectedValue and ExpectedValueInUse in ConfigBaseline after this step.
+Step 2: Create the Drift Detection Script
+
+This script compares all settings in sys.configurations against the baseline and logs any drift.
+sql
+-- Detect and log configuration drift
+INSERT INTO dbo.ConfigDriftLog (ConfigurationID, SettingName, ExpectedValue, CurrentValue)
+SELECT 
+    b.ConfigurationID,
+    b.SettingName,
+    b.ExpectedValueInUse,
+    c.value_in_use AS CurrentValue
+FROM dbo.ConfigBaseline b
+JOIN sys.configurations c ON b.ConfigurationID = c.configuration_id
+WHERE CONVERT(NVARCHAR(128), b.ExpectedValueInUse) <> CONVERT(NVARCHAR(128), c.value_in_use);
+
+-- Raise an alert if drift is detected
+IF @@ROWCOUNT > 0
+BEGIN
+    DECLARE @Message NVARCHAR(4000);
+    SET @Message = 'Configuration drift detected on ' + CAST(GETDATE() AS NVARCHAR(50)) + 
+                   '. ' + CAST(@@ROWCOUNT AS NVARCHAR(10)) + ' settings affected. Check dbo.ConfigDriftLog.';
+    RAISERROR (@Message, 16, 1);
+END
+ELSE
+BEGIN
+    PRINT 'No configuration drift detected.';
+END;
+
+This checks value_in_use (the active setting) against the baseline. If you also want to track changes to the configured value (not yet applied), you could add a condition for b.ExpectedValue <> c.value.
+Step 3: Set Up the SQL Server Agent Job
+
+Here’s how to configure it in SSMS:
+
+    Open SSMS, expand “SQL Server Agent,” right-click “Jobs,” and select “New Job.”
+    General Tab:
+        Name: MonitorFullConfigDrift
+        Owner: A privileged account (e.g., sa).
+        Description: “Monitors all sys.configurations for drift.”
+    Steps Tab:
+        Click “New.”
+        Step Name: CheckFullConfigDrift
+        Type: Transact-SQL script (T-SQL)
+        Database: Where you created the tables (e.g., master).
+        Command: Paste the drift detection script from Step 2.
+        Click “OK.”
+    Schedules Tab:
+        Click “New.”
+        Name: DailyFullCheck
+        Schedule Type: Recurring
+        Frequency: Daily at 3:00 AM (or your preferred time).
+        Click “OK.”
+    Alerts Tab (Optional):
+        Click “New Alert.”
+        Name: FullConfigDriftAlert
+        Type: SQL Server event alert
+        Event: Severity 016 (matches the RAISERROR).
+        Database: Same as the job step.
+        Response: Notify an operator via email (set up Database Mail and an operator first if needed).
+        Click “OK.”
+    Notifications Tab:
+        Check “E-mail,” select your operator, and notify on “Job completion” or “Job failure.”
+        Click “OK” to save.
+
+Step 4: Test and Verify
+
+    Manually alter a setting to test (e.g., sp_configure 'max server memory (MB)', 8192; RECONFIGURE;).
+    Run the job: Right-click it in SSMS and select “Start Job at Step.”
+    Query the log:
+    sql
+
+    SELECT * FROM dbo.ConfigDriftLog;
+    You should see the changed setting logged, and an alert (if set up) should fire.
+
+Step 5: Enhance and Maintain
+
+    Full Scope: This tracks all 70+ settings in sys.configurations (exact number varies by SQL Server version). If you only care about a subset, filter ConfigBaseline with a WHERE clause (e.g., WHERE name IN ('max server memory (MB)', 'max degree of parallelism')).
+    Reset Baseline: If your desired configuration changes, truncate and repopulate ConfigBaseline:
+    sql
+
+TRUNCATE TABLE dbo.ConfigBaseline;
+INSERT INTO dbo.ConfigBaseline (ConfigurationID, SettingName, ExpectedValue, ExpectedValueInUse, Description)
+SELECT configuration_id, name, value, value_in_use, description FROM sys.configurations;
+Cleanup: Add a step to purge old ConfigDriftLog entries (e.g., keep last 30 days):
+sql
+
+    DELETE FROM dbo.ConfigDriftLog WHERE DriftDate < DATEADD(day, -30, GETDATE());
+
+This gives you comprehensive drift monitoring for all sys.configurations settings. It’s lightweight and scalable, though you might want to adjust the schedule or alert threshold if frequent changes are normal in your environment.
