@@ -1,0 +1,277 @@
+To implement this solution, you'll need to:
+
+    Replace 'YourDatabaseName' with your actual database name where you want to store the monitoring data
+    Replace 'YourMailProfile' with your actual SQL Server Database Mail profile name
+    Replace 'dba@yourcompany.com' with the actual email address(es) for alerts
+    Configure Database Mail if not already set up
+
+This solution includes:
+
+    A history table to store sync status
+    A monitoring procedure that runs every 5 minutes
+    Immediate alerts when sync issues persist for 45+ minutes
+    A monthly report sent on the 1st of each month showing outages ≥ 45 minutes
+    Two SQL Agent jobs to handle the monitoring and reporting
+
+The monitoring job:
+
+    Runs every 5 minutes
+    Records current AG sync status
+    Alerts if any replica remains out of sync for 45+ minutes
+
+The reporting job:
+
+    Runs monthly on the 1st at 9:00 AM
+    Reports all outages ≥ 45 minutes from the previous month
+    Includes AG name, replica, start/end times, and duration
+
+
+
+
+-- First, create a table to store the sync status history
+CREATE TABLE dbo.AGSyncStatusHistory (
+    RecordID INT IDENTITY(1,1) PRIMARY KEY,
+    CheckTime DATETIME NOT NULL DEFAULT GETDATE(),
+    AGName NVARCHAR(128) NOT NULL,
+    ReplicaServer NVARCHAR(256) NOT NULL,
+    SyncState NVARCHAR(60) NOT NULL,
+    LastSyncTime DATETIME NULL
+);
+
+-- Create the stored procedure for monitoring
+CREATE PROCEDURE dbo.usp_MonitorAGSyncStatus
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    -- Insert current status
+    INSERT INTO dbo.AGSyncStatusHistory (CheckTime, AGName, ReplicaServer, SyncState, LastSyncTime)
+    SELECT 
+        GETDATE() as CheckTime,
+        ag.name AS AGName,
+        ar.replica_server_name AS ReplicaServer,
+        dbrs.synchronization_state_desc AS SyncState,
+        dbrs.last_hardened_time AS LastSyncTime
+    FROM sys.availability_groups ag
+    JOIN sys.availability_replicas ar ON ag.group_id = ar.group_id
+    JOIN sys.dm_hadr_database_replica_states dbrs ON ar.replica_id = dbrs.replica_id
+    WHERE dbrs.is_local = 0;  -- Only monitor secondary replicas
+
+    -- Check for sync issues lasting 45+ minutes and alert
+    DECLARE @AlertMessage NVARCHAR(MAX) = '';
+    
+    SELECT @AlertMessage = @AlertMessage + 
+        'Availability Group: ' + AGName + 
+        ', Replica: ' + ReplicaServer + 
+        ', Sync State: ' + SyncState + 
+        ', Last Sync: ' + CONVERT(NVARCHAR(20), LastSyncTime, 120) + CHAR(13) + CHAR(10)
+    FROM (
+        SELECT DISTINCT 
+            h.AGName,
+            h.ReplicaServer,
+            h.SyncState,
+            h.LastSyncTime
+        FROM dbo.AGSyncStatusHistory h
+        WHERE h.CheckTime > DATEADD(MINUTE, -45, GETDATE())
+        AND h.SyncState NOT IN ('SYNCHRONIZED', 'SYNCHRONIZING')
+        AND NOT EXISTS (
+            SELECT 1 
+            FROM dbo.AGSyncStatusHistory h2 
+            WHERE h2.AGName = h.AGName 
+            AND h2.ReplicaServer = h.ReplicaServer 
+            AND h2.CheckTime > h.CheckTime 
+            AND h2.SyncState IN ('SYNCHRONIZED', 'SYNCHRONIZING')
+        )
+    ) AS ProblematicSyncs;
+
+    IF @AlertMessage != ''
+    BEGIN
+        EXEC msdb.dbo.sp_send_dbmail
+            @profile_name = 'YourMailProfile',  -- Replace with your mail profile
+            @recipients = 'dba@yourcompany.com',  -- Replace with your email
+            @subject = 'ALERT: Availability Group Sync Issues Detected',
+            @body = @AlertMessage;
+    END
+END;
+GO
+
+-- Create monthly reporting stored procedure
+CREATE PROCEDURE dbo.usp_MonthlyAGOutageReport
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @ReportMonth DATETIME = DATEADD(MONTH, -1, DATEADD(MONTH, DATEDIFF(MONTH, 0, GETDATE()), 0));
+    DECLARE @ReportText NVARCHAR(MAX) = 'Availability Group Sync Outage Report for ' + 
+        DATENAME(MONTH, @ReportMonth) + ' ' + CAST(YEAR(@ReportMonth) AS NVARCHAR(4)) + CHAR(13) + CHAR(10) + CHAR(13) + CHAR(10);
+
+    WITH OutagePeriods AS (
+        SELECT 
+            AGName,
+            ReplicaServer,
+            MIN(CheckTime) AS OutageStart,
+            MAX(CheckTime) AS OutageEnd,
+            DATEDIFF(MINUTE, MIN(CheckTime), MAX(CheckTime)) AS DurationMinutes
+        FROM (
+            SELECT 
+                AGName,
+                ReplicaServer,
+                CheckTime,
+                SyncState,
+                ROW_NUMBER() OVER (PARTITION BY AGName, ReplicaServer ORDER BY CheckTime) -
+                ROW_NUMBER() OVER (PARTITION BY AGName, ReplicaServer, SyncState ORDER BY CheckTime) AS Grp
+            FROM dbo.AGSyncStatusHistory
+            WHERE CheckTime >= DATEADD(MONTH, -1, DATEADD(MONTH, DATEDIFF(MONTH, 0, GETDATE()), 0))
+            AND CheckTime < DATEADD(MONTH, DATEDIFF(MONTH, 0, GETDATE()), 0)
+        ) AS G
+        WHERE SyncState NOT IN ('SYNCHRONIZED', 'SYNCHRONIZING')
+        GROUP BY AGName, ReplicaServer, Grp
+        HAVING DATEDIFF(MINUTE, MIN(CheckTime), MAX(CheckTime)) >= 45
+    )
+    SELECT @ReportText = @ReportText + 
+        'AG: ' + AGName + 
+        ', Replica: ' + ReplicaServer + 
+        ', Outage Start: ' + CONVERT(NVARCHAR(20), OutageStart, 120) + 
+        ', Outage End: ' + CONVERT(NVARCHAR(20), OutageEnd, 120) + 
+        ', Duration: ' + CAST(DurationMinutes AS NVARCHAR(10)) + ' minutes' + 
+        CHAR(13) + CHAR(10)
+    FROM OutagePeriods
+    ORDER BY OutageStart;
+
+    IF @@ROWCOUNT = 0
+        SET @ReportText = @ReportText + 'No outages exceeding 45 minutes were detected in the reporting period.';
+
+    EXEC msdb.dbo.sp_send_dbmail
+        @profile_name = 'YourMailProfile',  -- Replace with your mail profile
+        @recipients = 'dba@yourcompany.com',  -- Replace with your email
+        @subject = 'Monthly Availability Group Sync Report',
+        @body = @ReportText;
+END;
+GO
+
+-- Create the monitoring job
+USE [msdb]
+GO
+
+BEGIN TRANSACTION
+DECLARE @ReturnCode INT
+SELECT @ReturnCode = 0
+
+IF NOT EXISTS (SELECT name FROM msdb.dbo.syscategories WHERE name=N'Database Maintenance' AND category_class=1)
+BEGIN
+EXEC @ReturnCode = msdb.dbo.sp_add_category @class=N'JOB', @type=N'LOCAL', @name=N'Database Maintenance'
+IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback
+END
+
+DECLARE @jobId BINARY(16)
+EXEC @ReturnCode = msdb.dbo.sp_add_job @job_name=N'Monitor AG Sync Status', 
+    @enabled=1, 
+    @notify_level_eventlog=0, 
+    @notify_level_email=2, 
+    @notify_level_netsend=0, 
+    @notify_level_page=0, 
+    @delete_level=0, 
+    @description=N'Monitors AlwaysOn Availability Group sync status every 5 minutes', 
+    @category_name=N'Database Maintenance', 
+    @owner_login_name=N'sa', @job_id = @jobId OUTPUT
+IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback
+
+EXEC @ReturnCode = msdb.dbo.sp_add_jobstep @job_id=@jobId, @step_name=N'Check AG Sync Status', 
+    @step_id=1, 
+    @cmdexec_success_code=0, 
+    @on_success_action=1, 
+    @on_success_step_id=0, 
+    @on_fail_action=2, 
+    @on_fail_step_id=0, 
+    @retry_attempts=0, 
+    @retry_interval=0, 
+    @os_run_priority=0, @subsystem=N'TSQL', 
+    @command=N'EXEC dbo.usp_MonitorAGSyncStatus', 
+    @database_name=N'YourDatabaseName',  -- Replace with your database name
+    @flags=0
+IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback
+
+EXEC @ReturnCode = msdb.dbo.sp_update_job @job_id = @jobId, @start_step_id = 1
+IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback
+
+EXEC @ReturnCode = msdb.dbo.sp_add_jobschedule @job_id=@jobId, @name=N'Every 5 Minutes', 
+    @enabled=1, 
+    @freq_type=4, 
+    @freq_interval=1, 
+    @freq_subday_type=4, 
+    @freq_subday_interval=5, 
+    @freq_relative_interval=0, 
+    @freq_recurrence_factor=0, 
+    @active_start_date=20250226, 
+    @active_end_date=99991231, 
+    @active_start_time=0, 
+    @active_end_time=235959
+IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback
+
+EXEC @ReturnCode = msdb.dbo.sp_add_jobserver @job_id = @jobId, @server_name = N'(local)'
+IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback
+COMMIT TRANSACTION
+GOTO EndSave
+QuitWithRollback:
+    IF (@@TRANCOUNT > 0) ROLLBACK TRANSACTION
+EndSave:
+GO
+
+-- Create the monthly reporting job
+BEGIN TRANSACTION
+DECLARE @ReturnCode INT
+SELECT @ReturnCode = 0
+
+DECLARE @jobId BINARY(16)
+EXEC @ReturnCode = msdb.dbo.sp_add_job @job_name=N'Monthly AG Sync Report', 
+    @enabled=1, 
+    @notify_level_eventlog=0, 
+    @notify_level_email=0, 
+    @notify_level_netsend=0, 
+    @notify_level_page=0, 
+    @delete_level=0, 
+    @description=N'Generates monthly report of AG sync outages', 
+    @category_name=N'Database Maintenance', 
+    @owner_login_name=N'sa', @job_id = @jobId OUTPUT
+IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback
+
+EXEC @ReturnCode = msdb.dbo.sp_add_jobstep @job_id=@jobId, @step_name=N'Generate Monthly Report', 
+    @step_id=1, 
+    @cmdexec_success_code=0, 
+    @on_success_action=1, 
+    @on_success_step_id=0, 
+    @on_fail_action=2, 
+    @on_fail_step_id=0, 
+    @retry_attempts=0, 
+    @retry_interval=0, 
+    @os_run_priority=0, @subsystem=N'TSQL', 
+    @command=N'EXEC dbo.usp_MonthlyAGOutageReport', 
+    @database_name=N'YourDatabaseName',  -- Replace with your database name
+    @flags=0
+IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback
+
+EXEC @ReturnCode = msdb.dbo.sp_update_job @job_id = @jobId, @start_step_id = 1
+IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback
+
+EXEC @ReturnCode = msdb.dbo.sp_add_jobschedule @job_id=@jobId, @name=N'Monthly First Day', 
+    @enabled=1, 
+    @freq_type=32, 
+    @freq_interval=1, 
+    @freq_subday_type=1, 
+    @freq_subday_interval=0, 
+    @freq_relative_interval=1, 
+    @freq_recurrence_factor=1, 
+    @active_start_date=20250226, 
+    @active_end_date=99991231, 
+    @active_start_time=90000,  -- 9:00 AM
+    @active_end_time=235959
+IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback
+
+EXEC @ReturnCode = msdb.dbo.sp_add_jobserver @job_id = @jobId, @server_name = N'(local)'
+IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback
+COMMIT TRANSACTION
+GOTO EndSave
+QuitWithRollback:
+    IF (@@TRANCOUNT > 0) ROLLBACK TRANSACTION
+EndSave:
+GO
