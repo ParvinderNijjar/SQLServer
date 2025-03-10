@@ -1,0 +1,133 @@
+-- Step 1: Create stored procedure to check disk space
+USE [msdb]
+GO
+
+CREATE PROCEDURE [dbo].[usp_CheckDiskSpace]
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    -- Create temp table to store disk space info
+    CREATE TABLE #DriveSpace
+    (
+        DriveLetter CHAR(1),
+        FreeSpaceMB DECIMAL(18,2),
+        TotalSpaceMB DECIMAL(18,2)
+    )
+
+    -- Get disk space info using xp_fixeddrives
+    INSERT INTO #DriveSpace (DriveLetter, FreeSpaceMB)
+    EXEC master.dbo.xp_fixeddrives
+
+    -- Get total space using filesystemobject
+    DECLARE @FSO int, @Drive int, @DriveLetter char(1), @TotalSpace bigint
+    DECLARE drive_cursor CURSOR FOR 
+        SELECT DriveLetter FROM #DriveSpace
+    
+    OPEN drive_cursor
+    FETCH NEXT FROM drive_cursor INTO @DriveLetter
+
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        EXEC @FSO = sp_OACreate 'Scripting.FileSystemObject', @FSO OUT
+        EXEC @Drive = sp_OAMethod @FSO, 'GetDrive', @Drive OUT, @DriveLetter
+        EXEC sp_OAGetProperty @Drive, 'TotalSize', @TotalSpace OUT
+        
+        UPDATE #DriveSpace 
+        SET TotalSpaceMB = @TotalSpace / 1048576.0 -- Convert bytes to MB
+        WHERE DriveLetter = @DriveLetter
+        
+        EXEC sp_OADestroy @Drive
+        EXEC sp_OADestroy @FSO
+        
+        FETCH NEXT FROM drive_cursor INTO @DriveLetter
+    END
+    
+    CLOSE drive_cursor
+    DEALLOCATE drive_cursor
+
+    -- Calculate percentage and check threshold
+    DECLARE @AlertMessage nvarchar(max) = ''
+    
+    SELECT @AlertMessage = @AlertMessage + 
+        'Drive ' + DriveLetter + ': ' + 
+        CAST(CAST(FreeSpaceMB/TotalSpaceMB * 100 AS DECIMAL(5,2)) AS VARCHAR(10)) + 
+        '% free space remaining (' + 
+        CAST(FreeSpaceMB AS VARCHAR(20)) + ' MB free of ' + 
+        CAST(TotalSpaceMB AS VARCHAR(20)) + ' MB total)' + CHAR(13) + CHAR(10)
+    FROM #DriveSpace
+    WHERE FreeSpaceMB/TotalSpaceMB < 0.20  -- Less than 20% free
+
+    -- If any drives are below threshold, send alert
+    IF @AlertMessage != ''
+    BEGIN
+        DECLARE @Subject nvarchar(255) = 'Low Disk Space Alert on ' + @@SERVERNAME
+        
+        EXEC msdb.dbo.sp_send_dbmail
+            @profile_name = 'YourMailProfile',  -- Replace with your mail profile
+            @recipients = 'dba@yourcompany.com', -- Replace with your email
+            @subject = @Subject,
+            @body = @AlertMessage
+    END
+
+    DROP TABLE #DriveSpace
+END
+GO
+
+-- Step 2: Create SQL Server Agent Job
+USE [msdb]
+GO
+
+BEGIN TRANSACTION
+DECLARE @ReturnCode INT
+SELECT @ReturnCode = 0
+
+-- Add the job
+EXEC @ReturnCode = msdb.dbo.sp_add_job 
+    @job_name=N'Check Disk Space Alert', 
+    @enabled=1, 
+    @notify_level_eventlog=2, 
+    @notify_level_email=2, 
+    @notify_level_netsend=0, 
+    @notify_level_page=0, 
+    @description=N'Checks all drives for less than 20% free space and sends alert',
+    @category_name=N'Database Maintenance'
+
+IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback
+
+-- Add job step
+EXEC @ReturnCode = msdb.dbo.sp_add_jobstep 
+    @job_name=N'Check Disk Space Alert', 
+    @step_name=N'Check Disk Space', 
+    @step_id=1, 
+    @subsystem=N'TSQL', 
+    @command=N'EXEC [dbo].[usp_CheckDiskSpace]', 
+    @database_name=N'msdb'
+
+IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback
+
+-- Add schedule (runs daily at 8 AM)
+EXEC @ReturnCode = msdb.dbo.sp_add_jobschedule 
+    @job_name=N'Check Disk Space Alert', 
+    @name=N'Daily 8AM', 
+    @enabled=1, 
+    @freq_type=4,    -- Daily
+    @freq_interval=1,
+    @freq_subday_type=1,
+    @active_start_time=80000  -- 8:00 AM
+
+IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback
+
+-- Add job to server
+EXEC @ReturnCode = msdb.dbo.sp_add_jobserver 
+    @job_name=N'Check Disk Space Alert'
+
+IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback
+
+COMMIT TRANSACTION
+GOTO EndSave
+
+QuitWithRollback:
+    IF (@@TRANCOUNT > 0) ROLLBACK TRANSACTION
+EndSave:
+GO
