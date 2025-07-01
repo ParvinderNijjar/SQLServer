@@ -1,0 +1,94 @@
+USE [msdb]
+GO
+
+-- Create the job
+DECLARE @jobId BINARY(16)
+EXEC msdb.dbo.sp_add_job 
+    @job_name = N'Monitor_SQL_Connections',
+    @enabled = 1,
+    @notify_level_email = 2,
+    @notify_level_page = 2,
+    @delete_level = 0,
+    @description = N'Monitors SQL Server connections every 5 minutes and emails report if monthly connections < 500',
+    @category_name = N'[Uncategorized (Local)]',
+    @owner_login_name = N'sa',
+    @job_id = @jobId OUTPUT
+
+-- Add job step
+EXEC msdb.dbo.sp_add_jobstep 
+    @job_id = @jobId,
+    @step_name = N'Check_Connections',
+    @step_id = 1,
+    @cmdexec_success_code = 0,
+    @on_success_action = 1,
+    @on_fail_action = 2,
+    @retry_attempts = 0,
+    @retry_interval = 0,
+    @os_run_priority = 0,
+    @subsystem = N'TSQL',
+    @command = N'
+-- Create temp table to store connection counts
+IF OBJECT_ID(''tempdb..#ConnectionCounts'') IS NOT NULL
+    DROP TABLE #ConnectionCounts
+
+CREATE TABLE #ConnectionCounts (
+    CheckDate DATETIME,
+    ConnectionCount INT
+)
+
+-- Insert current connection count
+INSERT INTO #ConnectionCounts (CheckDate, ConnectionCount)
+SELECT 
+    GETDATE(),
+    COUNT(*) as ConnectionCount
+FROM sys.dm_exec_sessions
+WHERE is_user_process = 1
+
+-- Check monthly connection count
+DECLARE @MonthlyCount INT
+SELECT @MonthlyCount = SUM(ConnectionCount)
+FROM #ConnectionCounts
+WHERE CheckDate >= DATEADD(MONTH, -1, GETDATE())
+
+-- If monthly count < 500, send email
+IF @MonthlyCount < 500
+BEGIN
+    DECLARE @EmailBody NVARCHAR(MAX)
+    SET @EmailBody = N''Monthly connection count is low: '' + CAST(@MonthlyCount AS NVARCHAR(10)) + 
+        N'' connections in the last 30 days. Please investigate.''
+
+    EXEC msdb.dbo.sp_send_dbmail
+        @profile_name = ''Your_Email_Profile_Name'',
+        @recipients = ''your_email@domain.com'',
+        @subject = ''Low SQL Server Connections Alert'',
+        @body = @EmailBody
+END
+
+-- Clean up
+DROP TABLE #ConnectionCounts
+',
+    @database_name = N'master',
+    @flags = 0
+
+-- Add job schedule (every 5 minutes)
+EXEC msdb.dbo.sp_add_jobschedule 
+    @job_id = @jobId,
+    @name = N'Every_5_Minutes',
+    @enabled = 1,
+    @freq_type = 4,        -- Daily
+    @freq_interval = 1,
+    @freq_subday_type = 4, -- Minutes
+    @freq_subday_interval = 5,
+    @freq_relative_interval = 0,
+    @freq_recurrence_factor = 0,
+    @active_start_date = 20250701,
+    @active_end_date = 99991231,
+    @active_start_time = 0,
+    @active_end_time = 235959
+
+-- Add job to server
+EXEC msdb.dbo.sp_add_jobserver 
+    @job_id = @jobId,
+    @server_name = N'(local)'
+
+GO
