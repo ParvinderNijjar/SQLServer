@@ -1,24 +1,82 @@
+USE [master]
+GO
+
+-- Create table to store connection details
+IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'ConnectionLog')
+CREATE TABLE ConnectionLog (
+    LogID INT IDENTITY(1,1) PRIMARY KEY,
+    LogDate DATETIME NOT NULL,
+    SessionID INT NOT NULL,
+    LoginName NVARCHAR(128),
+    HostName NVARCHAR(128),
+    ProgramName NVARCHAR(128),
+    ClientNetAddress NVARCHAR(48),
+    LoginTime DATETIME,
+    DatabaseName NVARCHAR(128)
+)
+
+GO
+
 USE [msdb]
 GO
 
 -- Create the job
 DECLARE @jobId BINARY(16)
 EXEC msdb.dbo.sp_add_job 
-    @job_name = N'Monitor_SQL_Connections',
+    @job_name = N'Connection_Monitoring',
     @enabled = 1,
     @notify_level_email = 2,
     @notify_level_page = 2,
     @delete_level = 0,
-    @description = N'Monitors SQL Server connections every 5 minutes and emails report if monthly connections < 500',
+    @description = N'Stores SQL Server connection details every 5 minutes and emails report on 1st of month',
     @category_name = N'[Uncategorized (Local)]',
     @owner_login_name = N'sa',
     @job_id = @jobId OUTPUT
 
--- Add job step
+-- Add job step to collect connection details
 EXEC msdb.dbo.sp_add_jobstep 
     @job_id = @jobId,
-    @step_name = N'Check_Connections',
+    @step_name = N'Collect_Connection_Details',
     @step_id = 1,
+    @cmdexec_success_code = 0,
+    @on_success_action = 3, -- Go to next step
+    @on_fail_action = 2,
+    @retry_attempts = 0,
+    @retry_interval = 0,
+    @os_run_priority = 0,
+    @subsystem = N'TSQL',
+    @command = N'
+INSERT INTO master.dbo.ConnectionLog (
+    LogDate,
+    SessionID,
+    LoginName,
+    HostName,
+    ProgramName,
+    ClientNetAddress,
+    LoginTime,
+    DatabaseName
+)
+SELECT 
+    GETDATE(),
+    s.session_id,
+    s.login_name,
+    s.host_name,
+    s.program_name,
+    c.client_net_address,
+    s.login_time,
+    DB_NAME(s.database_id)
+FROM sys.dm_exec_sessions s
+LEFT JOIN sys.dm_exec_connections c ON s.session_id = c.session_id
+WHERE s.is_user_process = 1
+',
+    @database_name = N'master',
+    @flags = 0
+
+-- Add job step to send monthly report
+EXEC msdb.dbo.sp_add_jobstep 
+    @job_id = @jobId,
+    @step_name = N'Send_Monthly_Report',
+    @step_id = 2,
     @cmdexec_success_code = 0,
     @on_success_action = 1,
     @on_fail_action = 2,
@@ -27,45 +85,27 @@ EXEC msdb.dbo.sp_add_jobstep
     @os_run_priority = 0,
     @subsystem = N'TSQL',
     @command = N'
--- Create temp table to store connection counts
-IF OBJECT_ID(''tempdb..#ConnectionCounts'') IS NOT NULL
-    DROP TABLE #ConnectionCounts
-
-CREATE TABLE #ConnectionCounts (
-    CheckDate DATETIME,
-    ConnectionCount INT
-)
-
--- Insert current connection count
-INSERT INTO #ConnectionCounts (CheckDate, ConnectionCount)
-SELECT 
-    GETDATE(),
-    COUNT(*) as ConnectionCount
-FROM sys.dm_exec_sessions
-WHERE is_user_process = 1
-
--- Check monthly connection count
-DECLARE @MonthlyCount INT
-SELECT @MonthlyCount = SUM(ConnectionCount)
-FROM #ConnectionCounts
-WHERE CheckDate >= DATEADD(MONTH, -1, GETDATE())
-
--- If monthly count < 500, send email
-IF @MonthlyCount < 500
+IF DAY(GETDATE()) = 1 AND DATEPART(HOUR, GETDATE()) = 0
 BEGIN
+    DECLARE @ConnectionCount INT
     DECLARE @EmailBody NVARCHAR(MAX)
-    SET @EmailBody = N''Monthly connection count is low: '' + CAST(@MonthlyCount AS NVARCHAR(10)) + 
-        N'' connections in the last 30 days. Please investigate.''
+    
+    SELECT @ConnectionCount = COUNT(*) 
+    FROM master.dbo.ConnectionLog
+    WHERE LogDate >= DATEADD(MONTH, -1, DATEADD(MONTH, DATEDIFF(MONTH, 0, GETDATE()), 0))
+    AND LogDate < DATEADD(MONTH, DATEDIFF(MONTH, 0, GETDATE()), 0)
+
+    SET @EmailBody = N''Monthly Connection Report for '' + 
+        DATENAME(MONTH, DATEADD(MONTH, -1, GETDATE())) + '':'' + CHAR(13) + CHAR(10) +
+        N''Total Connections: '' + CAST(@ConnectionCount AS NVARCHAR(10)) + CHAR(13) + CHAR(10) +
+        N''Report generated on: '' + CONVERT(NVARCHAR(20), GETDATE(), 120)
 
     EXEC msdb.dbo.sp_send_dbmail
         @profile_name = ''Your_Email_Profile_Name'',
         @recipients = ''your_email@domain.com'',
-        @subject = ''Low SQL Server Connections Alert'',
+        @subject = ''Monthly SQL Server Connection Report'',
         @body = @EmailBody
 END
-
--- Clean up
-DROP TABLE #ConnectionCounts
 ',
     @database_name = N'master',
     @flags = 0
