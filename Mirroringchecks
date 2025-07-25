@@ -1,0 +1,106 @@
+Below is a comprehensive checklist, categorized for clarity, based on Microsoft's documentation. Focus on both principal and mirror servers
+
+1. Mirroring Session Health and Status Checks
+
+Verify the mirroring state, role, and connectivity to detect suspensions or disconnections.
+
+Check Database Mirroring Status: Use the catalog view to monitor state and roles.
+
+SELECT 
+    DB_NAME(database_id) AS DatabaseName,
+    mirroring_state_desc AS MirroringState,  -- e.g., SYNCHRONIZED, SUSPENDED
+    mirroring_role_desc AS Role,  -- PRINCIPAL or MIRROR
+    mirroring_safety_level_desc AS SafetyLevel,  -- FULL (synchronous) or OFF (asynchronous)
+    mirroring_partner_name AS PartnerName,
+    mirroring_witness_name AS WitnessName,
+    mirroring_connection_timeout AS ConnectionTimeoutSeconds
+FROM sys.database_mirroring
+WHERE mirroring_guid IS NOT NULL;  -- Filter to mirrored databases only
+
+What to check
+MirroringState should be SYNCHRONIZED or SYNCHRONIZING. If SUSPENDED, investigate (e.g., network issues). Ensure roles and safety levels match your configuration.
+
+Check Mirroring Connections: Monitor active connections
+
+SELECT 
+    connection_id,
+    transport_stream_id,
+    state_desc AS ConnectionState,  -- e.g., CONNECTED, DISCONNECTED
+    connect_time,
+    login_time,
+    encryption_algorithm_desc AS Encryption,
+    is_send_flow_controlled AS FlowControlled
+FROM sys.dm_db_mirroring_connections;
+
+What to check: 
+ConnectionState as CONNECTED. High flow control indicates bottlenecks.
+
+Check Endpoints: Ensure mirroring endpoints are healthy.
+
+SELECT 
+    name AS EndpointName,
+    state_desc AS EndpointState,  -- STARTED, STOPPED, DISABLED
+    role_desc AS Role,  -- PARTNER, WITNESS, ALL
+    encryption_algorithm_desc AS Encryption
+FROM sys.database_mirroring_endpoints;
+
+What to check: 
+EndpointState as STARTED. Verify encryption if required
+
+2. Performance and Data Flow Monitoring
+
+Track log send/redo queues and transaction delays to measure mirroring efficiency and potential data loss (RPO) or failover time (RTO).
+
+Monitor Send and Redo Queues: Calculate unsent and unrestored log.
+
+SELECT 
+    DB_NAME(database_id) AS DatabaseName,
+    log_send_queue_size / 1024.0 AS UnsentLogMB,  -- On principal: Potential data loss
+    redo_queue_size / 1024.0 AS UnrestoredLogMB,  -- On mirror: Failover time estimate
+    log_send_rate / 1024.0 AS LogSendRateMBps,
+    redo_rate / 1024.0 AS RedoRateMBps
+FROM sys.dm_db_mirroring_connections;  -- Run on both servers for full view
+
+What to check
+Low queues (<1 MB ideal). High unsent log indicates network latency; high redo queue suggests mirror server overload. Compare rates for bottlenecks.
+
+Performance Counters (via Performance Monitor or sys.dm_os_performance_counters):
+
+Use the SQLServer:Database Mirroring object. Key counters include:
+
+    Bytes Sent to Replica/sec: Log bytes sent to mirror.
+    Bytes Sent to Transport/sec: Bytes sent over network.
+    Log Bytes Sent/sec: Log transfer rate (monitor for drops).
+    Log Send Queue: Unsent log in KB (high values = backlog).
+    Redo Bytes/sec: Rate of log redone on mirror.
+    Redo Queue: Unrestored log in KB.
+    Transaction Delay: Delay in ms per transaction (relevant in high-safety mode).
+    Log Compressed Bytes/sec: Compressed log sent (if compression enabled).
+    Pages Sent/sec: Pages sent for page repair.
+    What to check: Consistent rates; alerts on sustained high queues (>10 MB) or delays (>100 ms). Query via T-SQL
+    SELECT 
+        object_name, 
+        counter_name, 
+        cntr_value
+    FROM sys.dm_os_performance_counters 
+    WHERE object_name LIKE '%Database Mirroring%';
+
+3. Logs, Errors, and Troubleshooting
+
+Error Logs
+
+Scan for mirroring errors.
+
+EXEC sp_readerrorlog 0, 1, 'Mirroring';
+
+What to check
+Errors like connection timeouts, endpoint issues, or automatic page repair.
+
+4. Tools and Dashboards
+
+Database Mirroring Monitor: Launch from SSMS (Object Explorer > Database > Tasks > Launch Database Mirroring Monitor). Register databases to view status, history, and warnings.
+
+What to check
+Status tab for real-time metrics (updated every 30 seconds); Warnings tab for thresholds. Sysadmins can update; dbm_monitor role for view-only.
+
+
