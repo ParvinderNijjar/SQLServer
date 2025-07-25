@@ -1,0 +1,133 @@
+Monitoring SQL Server Always On Availability Groups (AGs) is essential for maintaining high availability, performance, and disaster recovery. 
+
+I'll focus on core checks
+
+1. Availability Group and Replica Health Checks
+Monitor overall AG status, synchronization, and operational health.
+
+SELECT 
+    ag.name AS AGName,
+    ags.primary_replica AS PrimaryReplica,
+    ags.synchronization_health_desc AS SyncHealth,
+    ags.operational_state_desc AS OperationalState
+FROM sys.availability_groups ag
+JOIN sys.dm_hadr_availability_group_states ags
+    ON ag.group_id = ags.group_id;
+
+What to check 
+`SyncHealth` should be `HEALTHY` investigate if `NOT_HEALTHY`. 
+`OperationalState` should be `ONLINE`.
+
+
+For replicas:
+
+SELECT 
+    ar.replica_server_name AS ReplicaName,
+    drs.synchronization_state_desc AS SyncState,
+    drs.synchronization_health_desc AS SyncHealth,
+    drs.log_send_queue_size AS LogSendQueueSizeKB,
+    drs.redo_queue_size AS RedoQueueSizeKB,
+    drs.suspend_reason_desc AS SuspendReason
+FROM sys.dm_hadr_database_replica_states drs
+JOIN sys.availability_replicas ar 
+    ON drs.replica_id = ar.replica_id;
+
+What to check
+`SyncState` as `SYNCHRONIZED` (sync) or `SYNCHRONIZING` (async). `SyncHealth` as `HEALTHY`. 
+Low queue sizes (<100 KB). 
+`SuspendReason` as `NULL`; if suspended, data movement is paused.
+
+2. Failover Readiness and Mode Checks
+Verify configurations for failover and availability modes.
+
+SELECT 
+    ar.replica_server_name AS ReplicaName,
+    ar.availability_mode_desc AS AvailabilityMode,
+    ar.failover_mode_desc AS FailoverMode,
+    drs.is_primary_replica AS IsPrimary,
+    ar.secondary_role_allow_connections_desc AS ReadableSecondary
+FROM sys.availability_replicas ar
+JOIN sys.dm_hadr_database_replica_states drs 
+    ON ar.replica_id = drs.replica_id;
+
+What to check
+Align with design (e.g., `SYNCHRONOUS_COMMIT` with `AUTOMATIC` for auto-failover).
+
+
+3. Cluster and Quorum Health
+Check Windows Server Failover Cluster (WSFC) nodes.
+
+SELECT 
+    member_name AS MemberName,
+    member_type_desc AS MemberType,
+    member_state_desc AS MemberState,
+    number_of_quorum_votes AS QuorumVotes
+FROM sys.dm_hadr_cluster_members;
+
+What to check
+`MemberState` as `ONLINE`. 
+Ensure quorum votes match configuration. W
+SFC monitors primary replica health via cluster role.
+
+
+
+4. Latency, Performance, and Synchronization Metrics
+Monitor log send/redo and calculate RTO/RPO.
+
+SELECT 
+    ar.replica_server_name AS ReplicaName,
+    dbs.name AS DatabaseName,
+    drs.log_send_rate AS LogSendRateKBps,
+    drs.redo_rate AS RedoRateKBps,
+    DATEDIFF(second, drs.last_commit_time, GETDATE()) AS CommitLatencySec,
+    drs.log_send_queue_size / drs.log_send_rate AS EstimatedRPO  -- Approximate RPO in seconds
+    drs.redo_queue_size / drs.redo_rate AS EstimatedRTO  -- Approximate RTO in seconds
+FROM sys.dm_hadr_database_replica_states drs
+JOIN sys.availability_replicas ar 
+    ON drs.replica_id = ar.replica_id
+JOIN sys.databases dbs 
+    ON drs.database_id = dbs.database_id;
+
+What to check
+Low latency (<5 sec). 
+Use for RTO (`redo_queue_size / redo_rate`) and RPO (`log_send_queue_size / log generation rate`).
+
+5. Listener and Connectivity Checks
+
+SELECT 
+    agl.dns_name AS ListenerName,
+    agl.port AS ListenerPort,
+    agl.ip_configuration_string_from_cluster AS IPConfig
+FROM sys.availability_group_listeners agl;
+
+What to check
+Validate IP and connectivity.
+
+
+6. Error Logs and Extended Events
+
+Query error log: `EXEC sp_readerrorlog 0, 1, 'AlwaysOn';`
+
+What to check
+Errors on connectivity, lease timeouts, or suspensions.
+
+7. Performance Counters (via System Monitor or PerfMon)
+
+Track these counters:
+SQLServer:Availability Replica: `Bytes Sent to Replica/sec`, `Bytes Sent to Transport/sec`, `Log Bytes Received/sec`, `Flow Control/sec`, `Flow Control Time (ms/sec)`.
+SQLServer:Database Replica: `Redone Bytes/sec`.
+SQLServer:Databases: `Log Bytes Flushed/sec`, `Log Flush Write Time (ms)`, `Log Flushes/sec`, `Log Pool Cache Misses/sec`, `Log Pool Disk Reads/sec`, `Log Pool Requests/sec`.
+
+What to check 
+Consistent rates; spikes in flow control indicate bottlenecks.
+
+8. Dashboards
+
+SSMS Always On Dashboard
+
+Visual overview of AG health, replicas, and databases. Use for quick checks on synchronization and failover readiness.
+
+
+Best Practices
+Run checks every 5-15 minutes via SQL Agent jobs.
+Set alerts for non-healthy states, e.g., using `sp_send_dbmail` if `synchronization_health_desc != 'HEALTHY'`.
