@@ -1,0 +1,102 @@
+Import-Module SQLSERVER
+
+$server1 = New-Object Microsoft.SqlServer.Management.Smo.Server "ServerA"
+$db1 = $server1.Databases["DBName"]
+$t1 = $db1.Tables["TableName", "dbo"]
+
+$server2 = New-Object Microsoft.SqlServer.Management.Smo.Server "ServerB"
+$db2 = $server2.Databases["DBName"]
+$t2 = $db2.Tables["TableName", "dbo"]
+
+# Compare columns between the two tables
+$cols1 = $t1.Columns | Select-Object -ExpandProperty Name
+$cols2 = $t2.Columns | Select-Object -ExpandProperty Name
+
+$onlyInServer1 = $cols1 | Where-Object { $_ -notin $cols2 }
+$onlyInServer2 = $cols2 | Where-Object { $_ -notin $cols1 }
+
+Write-Host "=== Columns only in ServerA ===" -ForegroundColor Yellow
+$onlyInServer1
+
+Write-Host "=== Columns only in ServerB ===" -ForegroundColor Cyan
+$onlyInServer2
+
+Write-Host "=== Columns in both ===" -ForegroundColor Green
+$cols1 | Where-Object { $_ -in $cols2 }
+
+
+
+
+
+# =============================================
+# FIXED: Compare Table Schema Between Two SQL Servers (SMO)
+# Replaces the broken $t1.CompareTo($t2) line
+# Works with your exact servers and table
+# =============================================
+
+Import-Module SQLServer -ErrorAction SilentlyContinue
+
+$server1Name = "ServerA"
+$server2Name = "ServerB"
+$databaseName = "DBName"
+$tableName    = "TableName"
+$schemaName   = "dbo"
+
+# Connect to both servers
+$server1 = New-Object Microsoft.SqlServer.Management.Smo.Server $server1Name
+$server2 = New-Object Microsoft.SqlServer.Management.Smo.Server $server2Name
+
+$db1 = $server1.Databases[$databaseName]
+$db2 = $server2.Databases[$databaseName]
+
+$t1 = $db1.Tables[$tableName, $schemaName]
+$t2 = $db2.Tables[$tableName, $schemaName]
+
+if (-not $t1) { 
+    Write-Host "Table not found on $server1Name" -ForegroundColor Red
+    return 
+}
+if (-not $t2) { 
+    Write-Host "Table not found on $server2Name" -ForegroundColor Red
+    return 
+}
+
+Write-Host "Comparing $schemaName.$tableName between $server1Name and $server2Name..." -ForegroundColor Cyan
+
+# =============================================
+# METHOD 1: Full CREATE SCRIPT COMPARISON (BEST - catches everything)
+# =============================================
+$script1 = ($t1.Script() | Out-String).Trim()
+$script2 = ($t2.Script() | Out-String).Trim()
+
+if ($script1 -eq $script2) {
+    Write-Host "`n✅ TABLES ARE 100% IDENTICAL" -ForegroundColor Green
+} else {
+    Write-Host "`n❌ TABLES ARE DIFFERENT" -ForegroundColor Red
+    
+    Write-Host "`nDifferences (first 30 lines shown):" -ForegroundColor Yellow
+    $diff = Compare-Object ($script1 -split "`r?`n") ($script2 -split "`r?`n") -IncludeEqual -ExcludeDifferent:$false
+    $diff | Select-Object -First 30 | Format-Table -AutoSize
+}
+
+# =============================================
+# METHOD 2: Column-by-Column comparison (easy to read)
+# =============================================
+Write-Host "`n`nColumn-level differences:" -ForegroundColor Cyan
+
+$cols1 = $t1.Columns | Select-Object Name, 
+    @{Name="DataType"; Expression={$_.DataType.Name}}, 
+    @{Name="Length"; Expression={$_.DataType.MaximumLength}}, 
+    Nullable, 
+    @{Name="Server"; Expression={$server1Name}}
+
+$cols2 = $t2.Columns | Select-Object Name, 
+    @{Name="DataType"; Expression={$_.DataType.Name}}, 
+    @{Name="Length"; Expression={$_.DataType.MaximumLength}}, 
+    Nullable, 
+    @{Name="Server"; Expression={$server2Name}}
+
+Compare-Object $cols1 $cols2 -Property Name, DataType, Length, Nullable -PassThru | 
+    Sort-Object Name | 
+    Format-Table -AutoSize
+
