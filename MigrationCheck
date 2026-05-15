@@ -1,0 +1,1560 @@
+# SQL Server Instance Upgrade & Migration Checklist
+
+A practitioner's reference for capturing pre-migration state, executing the cutover, and verifying everything afterwards. Scripts are designed to produce output that can be saved and diffed against a post-migration capture.
+
+---
+
+## 1. Critical risks to think about before you start
+
+Read this before the scripts. Most failed migrations fail on one of these.
+
+- **Login SIDs.** If you create logins on the target by name only (not by SID), every database user becomes orphaned. Always script logins with `SID` and password hash preserved (`sp_help_revlogin`, dbatools `Copy-DbaLogin`, or SMO with `ScriptingOptions.LoginSid = $true`). Verify with a SID comparison after cutover.
+- **Server collation mismatch.** If source and target instance collations differ, `tempdb`-related operations on user data with different collations will fail at runtime — and you cannot change instance collation without a rebuild. Confirm `SERVERPROPERTY('Collation')` matches before you ever copy a database.
+- **Compatibility level.** Migrating from an older version doesn't auto-bump compatibility level. Leaving it at the old level is the *safer* default — bumping it can change cardinality estimator behaviour and silently regress query plans. Decide explicitly, and if you bump, plan to use Query Store or `LEGACY_CARDINALITY_ESTIMATION` as a safety net.
+- **TDE certificates.** If any database uses TDE, you must back up and restore the certificate (and its private key) on the target *before* restoring the database. Lose the cert, lose the data. Period.
+- **Service Master Key / Database Master Keys.** Required for credentials, linked server passwords, encrypted columns, and TDE. Back these up.
+- **Trustworthy + cross-database ownership chaining + sysadmin db owner.** This combination is a privilege escalation path; migrations are a good time to fix it, but be aware that disabling it can break poorly designed apps.
+- **Trace flags and startup parameters.** Live in the registry / SQL Server Configuration Manager, not in any database. Easy to miss. Capture them explicitly.
+- **SQL Agent job owners.** Jobs owned by domain accounts that don't exist on the target will fail silently or refuse to run. Standardise to `sa` or a service principal.
+- **Linked server passwords.** Encrypted with the Service Master Key. If you don't preserve the SMK or re-create them, they break.
+- **Replication.** Survives a side-by-side migration poorly. In most cases, tear it down before migration and rebuild after.
+- **Always On AGs.** You cannot detach/attach AG databases trivially. Decide whether you're rebuilding the AG on the target, or whether you're adding the target as a new replica and failing over.
+- **CLR, FILESTREAM, FileTable, full-text catalogues, Service Broker.** All have caveats on migration. Catalogue them so nothing surprises you.
+- **Hardcoded server names in code.** Stored procedures, views, SSIS packages, and Agent jobs sometimes have `SourceServerName.DBName.dbo.Table` references. Greppable, but only if you look.
+- **DB Mail SMTP, audit destinations, error log paths, default backup paths.** Instance-level settings that don't move with databases.
+- **OS-level dependencies.** ODBC DSNs, file shares used by `xp_cmdshell` or BULK INSERT, SQLCLR assemblies signed with file-system certs, custom DLLs, PowerShell modules in startup scripts.
+- **Connection strings.** Aliases, MSDTC config, SPNs for Kerberos — if applications use Kerberos against your old SPN, the new SPN needs registering or auth falls back to NTLM (or fails).
+- **Recovery model and backup chains.** Restoring to a new instance breaks LSN continuity. Plan a fresh FULL backup immediately after cutover.
+- **Database Mail / Operators.** Verify the test mail actually sends from the target.
+- **Performance regression risk.** Statistics are valid across versions but should be updated with `FULLSCAN` after upgrade. Plan caches are wiped. Expect a warm-up period and don't panic-tune.
+
+---
+
+## 2. Approach
+
+For every check below, capture output to a file (CSV or tab-separated) on both source and target, named with date and host. Diff after cutover. A typical folder layout:
+
+```
+\\fileshare\migration\<project>\
+    source\
+        2026-05-15_HOSTA\
+            01_instance.csv
+            02_configurations.csv
+            ...
+    target\
+        2026-05-16_HOSTB\
+            ...
+    diffs\
+```
+
+In SSMS, run with `Results to Text` and column headers, or pipe via `sqlcmd -W -s"," -o file.csv`. In PowerShell, `Invoke-Sqlcmd ... | Export-Csv`.
+
+---
+
+## 3. Tooling note: dbatools
+
+[dbatools](https://dbatools.io) is the de facto community PowerShell module for SQL Server administration and migrations. It handles the SID/password/job-owner mess correctly out of the box. Even if you prefer your own scripts (control, audit trail, no module dependency on locked-down servers), it's worth knowing about:
+
+- `Export-DbaInstance` — exports nearly everything (logins, jobs, linked servers, configs, etc.) to scripted files.
+- `Copy-DbaLogin`, `Copy-DbaAgentJob`, `Copy-DbaLinkedServer`, `Copy-DbaCredential`, `Copy-DbaDbMail`, `Copy-DbaResourceGovernor`, `Copy-DbaSysDbUserObject`.
+- `Start-DbaMigration` — wraps the whole lot. Read carefully before running.
+- `Test-DbaMigrationConstraint` — flags issues that would block.
+
+The manual scripts below give you full visibility into what's being captured. Pick your approach per object type; mixing is fine.
+
+---
+
+## 4. PRE-MIGRATION: instance-level capture
+
+### 4.1 Version, edition, build, instance properties
+
+```sql
+SELECT
+    SERVERPROPERTY('MachineName')               AS machine_name,
+    SERVERPROPERTY('ServerName')                AS server_name,
+    SERVERPROPERTY('InstanceName')              AS instance_name,
+    SERVERPROPERTY('ProductVersion')            AS product_version,
+    SERVERPROPERTY('ProductLevel')              AS product_level,
+    SERVERPROPERTY('ProductUpdateLevel')        AS product_update_level,
+    SERVERPROPERTY('ProductUpdateReference')    AS product_update_reference,
+    SERVERPROPERTY('Edition')                   AS edition,
+    SERVERPROPERTY('EngineEdition')             AS engine_edition,
+    SERVERPROPERTY('Collation')                 AS collation,
+    SERVERPROPERTY('CollationID')               AS collation_id,
+    SERVERPROPERTY('LCID')                      AS lcid,
+    SERVERPROPERTY('IsClustered')               AS is_clustered,
+    SERVERPROPERTY('IsHadrEnabled')             AS is_hadr_enabled,
+    SERVERPROPERTY('HadrManagerStatus')         AS hadr_manager_status,
+    SERVERPROPERTY('IsFullTextInstalled')       AS is_fulltext_installed,
+    SERVERPROPERTY('IsIntegratedSecurityOnly')  AS is_integrated_security_only,
+    SERVERPROPERTY('IsAdvancedAnalyticsInstalled') AS is_advanced_analytics_installed,
+    SERVERPROPERTY('IsPolyBaseInstalled')       AS is_polybase_installed,
+    SERVERPROPERTY('FilestreamConfiguredLevel') AS filestream_configured_level,
+    SERVERPROPERTY('FilestreamEffectiveLevel')  AS filestream_effective_level,
+    SERVERPROPERTY('FilestreamShareName')       AS filestream_share_name,
+    SERVERPROPERTY('ResourceLastUpdateDateTime') AS resource_last_update,
+    @@VERSION                                   AS full_version;
+```
+
+### 4.2 sp_configure values
+
+```sql
+SELECT name, value, value_in_use, minimum, maximum, is_dynamic, is_advanced
+FROM sys.configurations
+ORDER BY name;
+```
+
+Pay particular attention to: `max server memory (MB)`, `min server memory (MB)`, `max degree of parallelism`, `cost threshold for parallelism`, `optimize for ad hoc workloads`, `backup compression default`, `remote admin connections`, `clr enabled`, `Database Mail XPs`, `Ole Automation Procedures`, `xp_cmdshell`.
+
+### 4.3 Trace flags
+
+```sql
+DBCC TRACESTATUS(-1);
+```
+
+Note this only shows currently-active flags. Permanent flags are set as startup parameters (next section).
+
+### 4.4 Startup parameters (PowerShell, run on the server)
+
+```powershell
+# Replace MSSQLSERVER with MSSQL$InstanceName for named instances
+$Instance = 'MSSQLSERVER'
+$RegPath  = "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\$Instance\MSSQLServer\Parameters"
+
+Get-ItemProperty -Path $RegPath |
+    Select-Object -Property * -ExcludeProperty PS* |
+    Format-List
+```
+
+Look for `-T` flags (trace flags), `-E` (extent allocation), `-g` (memory_to_reserve), and the master DB file paths.
+
+### 4.5 SQL Server service accounts and startup state (PowerShell)
+
+```powershell
+Get-CimInstance -ClassName Win32_Service -Filter "Name LIKE 'MSSQL%' OR Name LIKE 'SQL%' OR Name = 'MsDtsServer%'" |
+    Select-Object Name, DisplayName, StartName, State, StartMode, PathName |
+    Format-Table -AutoSize
+```
+
+### 4.6 tempdb configuration
+
+```sql
+SELECT
+    f.name                                 AS logical_name,
+    f.physical_name,
+    f.type_desc,
+    f.size * 8 / 1024                      AS size_mb,
+    CASE WHEN f.max_size = -1 THEN -1
+         ELSE f.max_size * 8 / 1024 END    AS max_size_mb,
+    CASE WHEN f.is_percent_growth = 1 THEN CAST(f.growth AS VARCHAR(10)) + '%'
+         ELSE CAST(f.growth * 8 / 1024 AS VARCHAR(10)) + ' MB' END AS growth
+FROM tempdb.sys.database_files f
+ORDER BY f.type_desc, f.file_id;
+```
+
+Capture also: number of data files (target: 1 per logical core up to 8), equal sizing, autogrowth in MB not %, trace flags 1117/1118 superseded by 2016+ default behaviour but worth noting if pre-2016.
+
+---
+
+## 5. PRE-MIGRATION: database-level capture
+
+### 5.1 Database inventory with options
+
+```sql
+SELECT
+    d.database_id,
+    d.name,
+    SUSER_SNAME(d.owner_sid)         AS owner,
+    d.create_date,
+    d.compatibility_level,
+    d.collation_name,
+    d.state_desc,
+    d.user_access_desc,
+    d.is_read_only,
+    d.recovery_model_desc,
+    d.page_verify_option_desc,
+    d.is_auto_close_on,
+    d.is_auto_shrink_on,
+    d.is_auto_create_stats_on,
+    d.is_auto_create_stats_incremental_on,
+    d.is_auto_update_stats_on,
+    d.is_auto_update_stats_async_on,
+    d.snapshot_isolation_state_desc,
+    d.is_read_committed_snapshot_on,
+    d.is_ansi_null_default_on,
+    d.is_ansi_nulls_on,
+    d.is_ansi_padding_on,
+    d.is_ansi_warnings_on,
+    d.is_arithabort_on,
+    d.is_concat_null_yields_null_on,
+    d.is_numeric_roundabort_on,
+    d.is_quoted_identifier_on,
+    d.is_recursive_triggers_on,
+    d.is_cursor_close_on_commit_on,
+    d.is_local_cursor_default,
+    d.is_fulltext_enabled,
+    d.is_trustworthy_on,
+    d.is_db_chaining_on,
+    d.is_parameterization_forced,
+    d.is_broker_enabled,
+    d.is_date_correlation_on,
+    d.is_cdc_enabled,
+    d.is_encrypted,
+    d.is_published,
+    d.is_subscribed,
+    d.is_merge_published,
+    d.is_distributor,
+    d.is_query_store_on,
+    d.containment_desc,
+    d.target_recovery_time_in_seconds,
+    d.delayed_durability_desc
+FROM sys.databases d
+ORDER BY d.name;
+```
+
+### 5.2 Database files (sizes, paths, growth)
+
+```sql
+SELECT
+    DB_NAME(mf.database_id)               AS database_name,
+    mf.file_id,
+    mf.type_desc,
+    mf.name                               AS logical_name,
+    mf.physical_name,
+    mf.state_desc,
+    mf.size * 8.0 / 1024                  AS size_mb,
+    CASE WHEN mf.max_size = -1 THEN -1
+         WHEN mf.max_size = 268435456 THEN -1  -- log "unlimited"
+         ELSE mf.max_size * 8.0 / 1024 END AS max_size_mb,
+    CASE WHEN mf.is_percent_growth = 1 THEN CAST(mf.growth AS VARCHAR(10)) + '%'
+         ELSE CAST(mf.growth * 8 / 1024 AS VARCHAR(10)) + ' MB' END AS growth,
+    mf.is_read_only
+FROM sys.master_files mf
+ORDER BY DB_NAME(mf.database_id), mf.type_desc, mf.file_id;
+```
+
+### 5.3 Filegroups per database
+
+```sql
+DECLARE @sql NVARCHAR(MAX) = N'';
+SELECT @sql = @sql + N'
+USE ' + QUOTENAME(name) + N';
+SELECT DB_NAME() AS database_name, fg.name AS filegroup_name, fg.type_desc,
+       fg.is_default, fg.is_read_only
+FROM sys.filegroups fg;'
+FROM sys.databases WHERE state_desc = 'ONLINE' AND database_id > 4;
+EXEC sp_executesql @sql;
+```
+
+### 5.4 Compatibility levels (called out separately for clarity)
+
+```sql
+SELECT name, compatibility_level
+FROM sys.databases
+ORDER BY name;
+```
+
+### 5.5 Last successful DBCC CHECKDB (critical pre-migration check)
+
+```sql
+SET NOCOUNT ON;
+DECLARE @results TABLE (
+    database_name SYSNAME,
+    last_known_good_checkdb VARCHAR(50)
+);
+DECLARE @DBInfo TABLE (
+    ParentObject NVARCHAR(255), [Object] NVARCHAR(255),
+    Field NVARCHAR(255), [Value] NVARCHAR(MAX)
+);
+DECLARE @dbname SYSNAME, @sql NVARCHAR(MAX);
+
+DECLARE c CURSOR LOCAL FAST_FORWARD FOR
+    SELECT name FROM sys.databases
+    WHERE state_desc = 'ONLINE' AND database_id <> 2;  -- skip tempdb
+OPEN c;
+FETCH NEXT FROM c INTO @dbname;
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    DELETE @DBInfo;
+    SET @sql = N'USE ' + QUOTENAME(@dbname) + N'; DBCC DBINFO WITH TABLERESULTS;';
+    BEGIN TRY
+        INSERT @DBInfo EXEC sp_executesql @sql;
+        INSERT @results
+        SELECT @dbname, [Value]
+        FROM @DBInfo
+        WHERE Field = 'dbi_dbccLastKnownGood';
+    END TRY
+    BEGIN CATCH
+        INSERT @results VALUES (@dbname, 'ERROR: ' + ERROR_MESSAGE());
+    END CATCH
+    FETCH NEXT FROM c INTO @dbname;
+END
+CLOSE c; DEALLOCATE c;
+SELECT * FROM @results ORDER BY last_known_good_checkdb;
+```
+
+If any database shows `1900-01-01` it has never had a successful CHECKDB. **Run CHECKDB before migrating.** If it fails on the source, fix corruption before going anywhere.
+
+### 5.6 Object counts per database (rough schema baseline)
+
+```sql
+DECLARE @sql NVARCHAR(MAX) = N'';
+SELECT @sql = @sql + N'
+USE ' + QUOTENAME(name) + N';
+SELECT DB_NAME() AS database_name, type_desc, COUNT(*) AS object_count
+FROM sys.objects
+WHERE is_ms_shipped = 0
+GROUP BY type_desc;'
+FROM sys.databases
+WHERE state_desc = 'ONLINE' AND database_id > 4;
+EXEC sp_executesql @sql;
+```
+
+### 5.7 Database-scoped configurations (2016+)
+
+```sql
+DECLARE @sql NVARCHAR(MAX) = N'';
+SELECT @sql = @sql + N'
+USE ' + QUOTENAME(name) + N';
+SELECT DB_NAME() AS database_name, configuration_id, name, value, value_for_secondary, is_value_default
+FROM sys.database_scoped_configurations;'
+FROM sys.databases WHERE state_desc = 'ONLINE' AND database_id > 4;
+EXEC sp_executesql @sql;
+```
+
+---
+
+## 6. PRE-MIGRATION: security capture
+
+### 6.1 All logins with SIDs and password hashes
+
+```sql
+SELECT
+    sp.name,
+    sp.principal_id,
+    sp.type_desc,
+    sp.is_disabled,
+    sp.create_date,
+    sp.modify_date,
+    sp.default_database_name,
+    sp.default_language_name,
+    CONVERT(VARCHAR(MAX), sp.sid, 1) AS sid_hex,
+    CONVERT(VARCHAR(MAX), sl.password_hash, 1) AS password_hash_hex,
+    sl.is_policy_checked,
+    sl.is_expiration_checked
+FROM sys.server_principals sp
+LEFT JOIN sys.sql_logins sl ON sp.principal_id = sl.principal_id
+WHERE sp.type IN ('S','U','G')
+  AND sp.name NOT LIKE '##%'
+  AND sp.name NOT IN ('NT SERVICE\SQLWriter','NT SERVICE\Winmgmt')
+ORDER BY sp.name;
+```
+
+To actually *script* the `CREATE LOGIN` statements with hashes preserved, use one of:
+
+- `sp_help_revlogin` (Microsoft KB 918992) — generates scripts with `HASHED` keyword.
+- dbatools `Export-DbaLogin -SqlInstance SOURCE -Path C:\Migration\logins.sql`.
+- SMO PowerShell (below).
+
+```powershell
+# SMO-based login scripting preserving SID and hashed password
+Import-Module SqlServer
+
+$SourceInstance = 'SOURCESERVER'
+$OutFile        = 'C:\Migration\Logins.sql'
+
+$srv = New-Object Microsoft.SqlServer.Management.Smo.Server $SourceInstance
+$opts = New-Object Microsoft.SqlServer.Management.Smo.ScriptingOptions
+$opts.LoginSid           = $true
+$opts.IncludeIfNotExists = $true
+$opts.ScriptDrops        = $false
+$opts.AllowSystemObjects = $false
+
+$lines = foreach ($login in $srv.Logins) {
+    if ($login.Name -match '^(##|NT (SERVICE|AUTHORITY)\\)' -or
+        $login.Name -eq 'sa') { continue }
+    try { $login.Script($opts) } catch { "-- FAILED: $($login.Name) : $($_.Exception.Message)" }
+}
+$lines | Out-File -FilePath $OutFile -Encoding utf8
+```
+
+### 6.2 Server role memberships
+
+```sql
+SELECT
+    r.name  AS role_name,
+    r.type_desc AS role_type,
+    m.name  AS member_name,
+    m.type_desc AS member_type
+FROM sys.server_role_members rm
+JOIN sys.server_principals r ON rm.role_principal_id  = r.principal_id
+JOIN sys.server_principals m ON rm.member_principal_id = m.principal_id
+ORDER BY r.name, m.name;
+```
+
+### 6.3 Server-level permissions (GRANT/DENY)
+
+```sql
+SELECT
+    pr.name           AS grantee,
+    pr.type_desc      AS grantee_type,
+    p.class_desc,
+    p.permission_name,
+    p.state_desc,
+    CASE p.class
+        WHEN 100 THEN 'SERVER'
+        WHEN 101 THEN SUSER_NAME(p.major_id)
+        WHEN 105 THEN OBJECT_NAME(p.major_id)  -- endpoint
+        ELSE CAST(p.major_id AS VARCHAR(20))
+    END AS secured_object
+FROM sys.server_permissions p
+JOIN sys.server_principals pr ON p.grantee_principal_id = pr.principal_id
+ORDER BY pr.name, p.permission_name;
+```
+
+### 6.4 Database users, roles, permissions (per database)
+
+```sql
+-- Database users with login mapping and orphan detection
+DECLARE @sql NVARCHAR(MAX) = N'';
+SELECT @sql = @sql + N'
+USE ' + QUOTENAME(name) + N';
+SELECT DB_NAME() AS database_name,
+       dp.name AS user_name,
+       dp.type_desc,
+       dp.default_schema_name,
+       CONVERT(VARCHAR(MAX), dp.sid, 1) AS sid_hex,
+       sp.name AS mapped_login,
+       CASE WHEN dp.type IN (''S'',''U'',''G'') AND dp.authentication_type_desc = ''INSTANCE''
+                 AND sp.sid IS NULL
+            THEN ''ORPHANED'' ELSE ''OK'' END AS status
+FROM sys.database_principals dp
+LEFT JOIN sys.server_principals sp ON dp.sid = sp.sid
+WHERE dp.principal_id > 4
+  AND dp.type IN (''S'',''U'',''G'',''C'',''K'');'
+FROM sys.databases WHERE state_desc = 'ONLINE' AND database_id > 4;
+EXEC sp_executesql @sql;
+
+-- Database role memberships
+SET @sql = N'';
+SELECT @sql = @sql + N'
+USE ' + QUOTENAME(name) + N';
+SELECT DB_NAME() AS database_name, r.name AS role_name, m.name AS member_name, m.type_desc
+FROM sys.database_role_members rm
+JOIN sys.database_principals r ON rm.role_principal_id  = r.principal_id
+JOIN sys.database_principals m ON rm.member_principal_id = m.principal_id;'
+FROM sys.databases WHERE state_desc = 'ONLINE' AND database_id > 4;
+EXEC sp_executesql @sql;
+
+-- Database-level permissions
+SET @sql = N'';
+SELECT @sql = @sql + N'
+USE ' + QUOTENAME(name) + N';
+SELECT DB_NAME() AS database_name,
+       pr.name AS grantee,
+       p.class_desc,
+       p.permission_name,
+       p.state_desc,
+       OBJECT_SCHEMA_NAME(p.major_id) + ''.'' + OBJECT_NAME(p.major_id) AS object_name
+FROM sys.database_permissions p
+JOIN sys.database_principals pr ON p.grantee_principal_id = pr.principal_id
+WHERE p.major_id > 0;'
+FROM sys.databases WHERE state_desc = 'ONLINE' AND database_id > 4;
+EXEC sp_executesql @sql;
+```
+
+### 6.5 Credentials
+
+```sql
+SELECT credential_id, name, credential_identity, create_date, modify_date, target_type, target_id
+FROM sys.credentials;
+```
+
+Credential passwords cannot be scripted; you'll need them from your secrets store. Capture the names so nothing gets missed.
+
+### 6.6 Linked servers and linked logins
+
+```sql
+SELECT
+    s.server_id,
+    s.name                  AS linked_server,
+    s.product,
+    s.provider,
+    s.data_source,
+    s.location,
+    s.provider_string,
+    s.catalog,
+    s.is_remote_login_enabled,
+    s.is_rpc_out_enabled,
+    s.is_data_access_enabled,
+    s.is_collation_compatible,
+    s.uses_self_credential,
+    s.lazy_schema_validation,
+    s.is_system,
+    s.connect_timeout,
+    s.query_timeout,
+    s.modify_date
+FROM sys.servers s
+WHERE s.server_id > 0;
+
+SELECT
+    s.name              AS linked_server,
+    ll.uses_self_credential,
+    sp.name             AS local_login,
+    ll.remote_name,
+    CASE WHEN ll.remote_password IS NULL THEN 'No password stored'
+         ELSE 'Password stored (cannot script)' END AS password_status
+FROM sys.linked_logins ll
+JOIN sys.servers s            ON ll.server_id = s.server_id
+LEFT JOIN sys.server_principals sp ON ll.local_principal_id = sp.principal_id
+WHERE s.server_id > 0;
+```
+
+Linked server passwords are encrypted with the Service Master Key. Options: (a) re-create with passwords from your secrets store on the target; (b) back up the SMK from source and restore it on target *before* you create the linked servers (preserves password decryption). Method (a) is cleaner.
+
+### 6.7 Endpoints
+
+```sql
+SELECT
+    e.name,
+    e.endpoint_id,
+    e.type_desc,
+    e.state_desc,
+    e.protocol_desc,
+    te.port,
+    te.ip_address,
+    e.is_admin_endpoint
+FROM sys.endpoints e
+LEFT JOIN sys.tcp_endpoints te ON e.endpoint_id = te.endpoint_id;
+
+-- Endpoint permissions (critical for AG and mirroring)
+SELECT
+    e.name AS endpoint_name,
+    pr.name AS grantee,
+    p.permission_name,
+    p.state_desc
+FROM sys.server_permissions p
+JOIN sys.endpoints e          ON p.major_id = e.endpoint_id AND p.class = 105
+JOIN sys.server_principals pr ON p.grantee_principal_id = pr.principal_id;
+```
+
+### 6.8 Encryption: TDE, certificates, asymmetric/symmetric keys
+
+```sql
+-- Service Master Key info
+SELECT * FROM sys.symmetric_keys WHERE name = '##MS_ServiceMasterKey##';
+
+-- Database Master Keys
+SELECT name, principal_id, symmetric_key_id, key_length, key_algorithm, key_guid
+FROM sys.symmetric_keys;
+
+-- Certificates per database
+DECLARE @sql NVARCHAR(MAX) = N'';
+SELECT @sql = @sql + N'
+USE ' + QUOTENAME(name) + N';
+SELECT DB_NAME() AS database_name, name, certificate_id, principal_id,
+       pvt_key_encryption_type_desc, issuer_name, cert_serial_number,
+       sid, start_date, expiry_date, thumbprint
+FROM sys.certificates;'
+FROM sys.databases WHERE state_desc = 'ONLINE' AND database_id > 4;
+EXEC sp_executesql @sql;
+
+-- TDE state per database
+SELECT
+    DB_NAME(database_id) AS database_name,
+    encryption_state,
+    CASE encryption_state
+         WHEN 0 THEN 'No encryption'
+         WHEN 1 THEN 'Unencrypted'
+         WHEN 2 THEN 'Encryption in progress'
+         WHEN 3 THEN 'Encrypted'
+         WHEN 4 THEN 'Key change in progress'
+         WHEN 5 THEN 'Decryption in progress'
+         WHEN 6 THEN 'Protection change in progress'
+    END AS encryption_state_desc,
+    key_algorithm,
+    key_length,
+    percent_complete,
+    encryptor_thumbprint
+FROM sys.dm_database_encryption_keys;
+```
+
+For every TDE-protected database, back up the cert *and its private key*:
+
+```sql
+USE master;
+BACKUP CERTIFICATE TDECert
+TO FILE = 'C:\Migration\TDECert.cer'
+WITH PRIVATE KEY (
+    FILE = 'C:\Migration\TDECert.pvk',
+    ENCRYPTION BY PASSWORD = '<strong-password-stored-in-secrets-vault>'
+);
+```
+
+Restore on target before restoring databases. **Do not lose this password.**
+
+### 6.9 Audits and audit specifications
+
+```sql
+SELECT * FROM sys.server_audits;
+SELECT * FROM sys.server_audit_specifications;
+SELECT * FROM sys.server_audit_specification_details;
+SELECT * FROM sys.dm_server_audit_status;
+
+DECLARE @sql NVARCHAR(MAX) = N'';
+SELECT @sql = @sql + N'
+USE ' + QUOTENAME(name) + N';
+SELECT DB_NAME() AS database_name, name AS audit_spec, is_state_enabled FROM sys.database_audit_specifications;
+SELECT DB_NAME() AS database_name, audit_action_name, class_desc, major_id, audited_principal_id FROM sys.database_audit_specification_details;'
+FROM sys.databases WHERE state_desc = 'ONLINE' AND database_id > 4;
+EXEC sp_executesql @sql;
+```
+
+---
+
+## 7. PRE-MIGRATION: SQL Server Agent
+
+### 7.1 Jobs, steps, schedules, owners
+
+```sql
+USE msdb;
+
+-- Jobs
+SELECT
+    j.job_id, j.name, j.enabled,
+    SUSER_SNAME(j.owner_sid) AS owner,
+    c.name AS category, j.description,
+    j.date_created, j.date_modified,
+    j.notify_level_eventlog, j.notify_level_email, j.notify_level_netsend, j.notify_level_page,
+    op.name AS notify_email_operator
+FROM dbo.sysjobs j
+LEFT JOIN dbo.syscategories c ON j.category_id = c.category_id
+LEFT JOIN dbo.sysoperators op ON j.notify_email_operator_id = op.id
+ORDER BY j.name;
+
+-- Job steps
+SELECT
+    j.name AS job_name,
+    s.step_id, s.step_name, s.subsystem, s.database_name, s.last_run_outcome,
+    s.command, s.on_success_action, s.on_fail_action, s.retry_attempts, s.retry_interval,
+    p.name AS proxy_name
+FROM dbo.sysjobs j
+JOIN dbo.sysjobsteps s ON j.job_id = s.job_id
+LEFT JOIN dbo.sysproxies p ON s.proxy_id = p.proxy_id
+ORDER BY j.name, s.step_id;
+
+-- Schedules
+SELECT
+    j.name AS job_name,
+    sch.name AS schedule_name, sch.enabled,
+    sch.freq_type, sch.freq_interval, sch.freq_subday_type, sch.freq_subday_interval,
+    sch.freq_relative_interval, sch.freq_recurrence_factor,
+    sch.active_start_date, sch.active_end_date,
+    sch.active_start_time, sch.active_end_time
+FROM dbo.sysjobs j
+JOIN dbo.sysjobschedules js ON j.job_id = js.job_id
+JOIN dbo.sysschedules    sch ON js.schedule_id = sch.schedule_id
+ORDER BY j.name, sch.name;
+
+-- Operators
+SELECT id, name, enabled, email_address, last_email_date
+FROM dbo.sysoperators;
+
+-- Alerts
+SELECT a.id, a.name, a.enabled, a.message_id, a.severity, a.database_name,
+       a.event_description_keyword, a.occurrence_count, a.last_occurrence_date,
+       op.name AS notify_operator
+FROM dbo.sysalerts a
+LEFT JOIN dbo.sysnotifications n ON a.id = n.alert_id
+LEFT JOIN dbo.sysoperators op    ON n.operator_id = op.id;
+
+-- Proxies
+SELECT p.proxy_id, p.name, c.name AS credential, p.enabled, p.description
+FROM dbo.sysproxies p
+LEFT JOIN sys.credentials c ON p.credential_id = c.credential_id;
+```
+
+Scripting jobs as `CREATE` statements is far easier in PowerShell:
+
+```powershell
+Import-Module SqlServer
+$srv = New-Object Microsoft.SqlServer.Management.Smo.Server 'SOURCESERVER'
+$opts = New-Object Microsoft.SqlServer.Management.Smo.ScriptingOptions
+$opts.IncludeIfNotExists = $true
+$opts.AgentJobId = $true
+$opts.AgentAlertJob = $true
+$opts.AgentNotify   = $true
+$srv.JobServer.Jobs | ForEach-Object { $_.Script($opts) } |
+    Out-File -FilePath 'C:\Migration\Jobs.sql' -Encoding utf8
+```
+
+Or `Copy-DbaAgentJob` / `Export-DbaAgentJob` from dbatools.
+
+### 7.2 Agent properties
+
+```sql
+EXEC msdb.dbo.sp_get_sqlagent_properties;
+```
+
+Includes job history rows per job, max history, mail profile used, etc.
+
+---
+
+## 8. PRE-MIGRATION: High availability / DR
+
+### 8.1 Always On Availability Groups
+
+```sql
+-- AG and replica state
+SELECT
+    ag.name                              AS ag_name,
+    ag.failure_condition_level,
+    ag.health_check_timeout,
+    ag.automated_backup_preference_desc,
+    ar.replica_server_name,
+    ar.endpoint_url,
+    ar.availability_mode_desc,
+    ar.failover_mode_desc,
+    ar.session_timeout,
+    ar.primary_role_allow_connections_desc,
+    ar.secondary_role_allow_connections_desc,
+    ar.seeding_mode_desc,
+    ar.backup_priority,
+    ars.role_desc,
+    ars.connected_state_desc,
+    ars.synchronization_health_desc,
+    ars.operational_state_desc,
+    ars.recovery_health_desc
+FROM sys.availability_groups ag
+JOIN sys.availability_replicas ar          ON ag.group_id = ar.group_id
+JOIN sys.dm_hadr_availability_replica_states ars ON ar.replica_id = ars.replica_id;
+
+-- Listeners
+SELECT
+    ag.name AS ag_name,
+    agl.dns_name, agl.port, agl.is_conformant,
+    agl.ip_configuration_string_from_cluster
+FROM sys.availability_group_listeners agl
+JOIN sys.availability_groups ag ON agl.group_id = ag.group_id;
+
+-- AG databases
+SELECT
+    ag.name AS ag_name,
+    DB_NAME(drs.database_id) AS database_name,
+    ar.replica_server_name,
+    drs.synchronization_state_desc,
+    drs.synchronization_health_desc,
+    drs.database_state_desc,
+    drs.is_suspended,
+    drs.suspend_reason_desc,
+    drs.log_send_queue_size,
+    drs.log_send_rate,
+    drs.redo_queue_size,
+    drs.redo_rate,
+    drs.last_sent_time, drs.last_received_time,
+    drs.last_hardened_time, drs.last_redone_time,
+    drs.last_commit_time
+FROM sys.dm_hadr_database_replica_states drs
+JOIN sys.availability_replicas ar  ON drs.replica_id = ar.replica_id
+JOIN sys.availability_groups   ag ON ar.group_id     = ag.group_id;
+
+-- Read-only routing
+SELECT
+    ag.name AS ag_name,
+    ar.replica_server_name AS primary_replica,
+    rr.routing_priority,
+    ar_target.replica_server_name AS routes_to
+FROM sys.availability_read_only_routing_lists rr
+JOIN sys.availability_replicas ar         ON rr.replica_id        = ar.replica_id
+JOIN sys.availability_replicas ar_target  ON rr.read_only_replica_id = ar_target.replica_id
+JOIN sys.availability_groups   ag         ON ar.group_id          = ag.group_id;
+```
+
+### 8.2 Log shipping
+
+```sql
+-- Primary databases
+SELECT * FROM msdb.dbo.log_shipping_primary_databases;
+SELECT * FROM msdb.dbo.log_shipping_primary_secondaries;
+SELECT * FROM msdb.dbo.log_shipping_monitor_primary;
+
+-- Secondary databases
+SELECT * FROM msdb.dbo.log_shipping_secondary;
+SELECT * FROM msdb.dbo.log_shipping_secondary_databases;
+SELECT * FROM msdb.dbo.log_shipping_monitor_secondary;
+```
+
+### 8.3 Database mirroring (legacy, deprecated but still present in some environments)
+
+```sql
+SELECT
+    DB_NAME(database_id) AS database_name,
+    mirroring_state_desc,
+    mirroring_role_desc,
+    mirroring_partner_name,
+    mirroring_partner_instance,
+    mirroring_witness_name,
+    mirroring_witness_state_desc,
+    mirroring_safety_level_desc
+FROM sys.database_mirroring
+WHERE mirroring_state IS NOT NULL;
+```
+
+### 8.4 Replication
+
+```sql
+-- Quick presence check
+SELECT name, is_published, is_subscribed, is_merge_published, is_distributor
+FROM sys.databases
+WHERE is_published = 1 OR is_subscribed = 1
+   OR is_merge_published = 1 OR is_distributor = 1;
+
+-- If distributor present
+USE distribution;
+SELECT * FROM dbo.MSpublications;
+SELECT * FROM dbo.MSsubscriptions;
+SELECT * FROM dbo.MSdistribution_agents;
+```
+
+### 8.5 Recent backup history
+
+```sql
+-- Last full, diff, log per database in the last 60 days
+WITH ranked AS (
+    SELECT
+        bs.database_name,
+        bs.type,
+        bs.backup_start_date,
+        bs.backup_finish_date,
+        bs.backup_size / 1024.0 / 1024.0 AS size_mb,
+        bs.compressed_backup_size / 1024.0 / 1024.0 AS compressed_size_mb,
+        bs.recovery_model,
+        bs.is_copy_only,
+        bmf.physical_device_name,
+        ROW_NUMBER() OVER (PARTITION BY bs.database_name, bs.type ORDER BY bs.backup_finish_date DESC) AS rn
+    FROM msdb.dbo.backupset bs
+    JOIN msdb.dbo.backupmediafamily bmf ON bs.media_set_id = bmf.media_set_id
+    WHERE bs.backup_finish_date > DATEADD(DAY, -60, GETDATE())
+)
+SELECT * FROM ranked WHERE rn <= 3
+ORDER BY database_name, type, backup_finish_date DESC;
+
+-- Databases that have NEVER been backed up (or not recently)
+SELECT
+    d.name,
+    d.recovery_model_desc,
+    MAX(bs.backup_finish_date) AS last_backup
+FROM sys.databases d
+LEFT JOIN msdb.dbo.backupset bs ON d.name = bs.database_name AND bs.type = 'D'
+WHERE d.database_id > 4
+GROUP BY d.name, d.recovery_model_desc
+ORDER BY last_backup;
+```
+
+---
+
+## 9. PRE-MIGRATION: other instance objects
+
+### 9.1 Database Mail
+
+```sql
+USE msdb;
+SELECT * FROM dbo.sysmail_profile;
+SELECT * FROM dbo.sysmail_account;
+SELECT * FROM dbo.sysmail_profileaccount;
+SELECT * FROM dbo.sysmail_principalprofile;
+SELECT name, value, description FROM dbo.sysmail_configuration;
+```
+
+Passwords for SMTP accounts cannot be scripted; treat them like credentials.
+
+### 9.2 Resource Governor
+
+```sql
+SELECT * FROM sys.resource_governor_configuration;
+SELECT * FROM sys.resource_governor_resource_pools;
+SELECT * FROM sys.resource_governor_workload_groups;
+SELECT * FROM sys.resource_governor_external_resource_pools;
+
+-- Classifier function (the actual function lives in master)
+SELECT
+    rgc.classifier_function_id,
+    OBJECT_NAME(rgc.classifier_function_id, DB_ID('master')) AS classifier_function,
+    OBJECT_DEFINITION(rgc.classifier_function_id) AS definition
+FROM sys.resource_governor_configuration rgc;
+```
+
+### 9.3 Extended Events sessions
+
+```sql
+SELECT
+    s.name,
+    s.create_time,
+    CASE WHEN dxs.name IS NOT NULL THEN 'Running' ELSE 'Stopped' END AS state,
+    s.startup_state
+FROM sys.server_event_sessions s
+LEFT JOIN sys.dm_xe_sessions dxs ON s.name = dxs.name
+ORDER BY s.name;
+
+-- To script a session definition
+SELECT name, event_session_id FROM sys.server_event_sessions;
+-- Right-click → Script Session As → CREATE in SSMS, or use SMO.
+```
+
+### 9.4 Service Broker
+
+```sql
+SELECT
+    name,
+    is_broker_enabled,
+    service_broker_guid,
+    is_trustworthy_on
+FROM sys.databases
+WHERE is_broker_enabled = 1;
+```
+
+If Service Broker is in use, the `service_broker_guid` changes when restored to a new instance with `WITH NEW_BROKER` — which breaks message routing. You may want `WITH ERROR_BROKER_CONVERSATIONS` or to preserve the GUID. Plan this per database.
+
+### 9.5 Full-text catalogs
+
+```sql
+DECLARE @sql NVARCHAR(MAX) = N'';
+SELECT @sql = @sql + N'
+USE ' + QUOTENAME(name) + N';
+SELECT DB_NAME() AS database_name, ftc.name AS catalog_name, ftc.path,
+       ftc.is_default, ftc.is_accent_sensitivity_on
+FROM sys.fulltext_catalogs ftc;
+SELECT DB_NAME() AS database_name, OBJECT_NAME(fti.object_id) AS table_name,
+       ftc.name AS catalog_name, fti.is_enabled,
+       fti.change_tracking_state_desc, fti.has_crawl_completed
+FROM sys.fulltext_indexes fti
+JOIN sys.fulltext_catalogs ftc ON fti.fulltext_catalog_id = ftc.fulltext_catalog_id;'
+FROM sys.databases
+WHERE state_desc = 'ONLINE' AND database_id > 4;
+EXEC sp_executesql @sql;
+```
+
+### 9.6 CLR assemblies
+
+```sql
+DECLARE @sql NVARCHAR(MAX) = N'';
+SELECT @sql = @sql + N'
+USE ' + QUOTENAME(name) + N';
+SELECT DB_NAME() AS database_name, a.name, a.principal_id, a.permission_set_desc,
+       a.is_visible, a.create_date, a.modify_date,
+       af.name AS file_name
+FROM sys.assemblies a
+JOIN sys.assembly_files af ON a.assembly_id = af.assembly_id
+WHERE a.is_user_defined = 1;'
+FROM sys.databases WHERE state_desc = 'ONLINE' AND database_id > 4;
+EXEC sp_executesql @sql;
+
+-- Trusted assemblies (instance-level, 2017+)
+SELECT * FROM sys.trusted_assemblies;
+```
+
+CLR security model changed significantly in 2017+ (CLR strict security). Assemblies that worked before may need to be signed and registered in `sys.trusted_assemblies` or have their certificate added.
+
+### 9.7 FILESTREAM / FileTable
+
+Already partially covered in `SERVERPROPERTY` and database options. Add:
+
+```sql
+DECLARE @sql NVARCHAR(MAX) = N'';
+SELECT @sql = @sql + N'
+USE ' + QUOTENAME(name) + N';
+SELECT DB_NAME() AS database_name, fg.name AS filegroup_name, fg.type_desc, fg.is_default
+FROM sys.filegroups fg
+WHERE fg.type_desc LIKE ''%FILESTREAM%'' OR fg.type_desc LIKE ''%MEMORY%'';
+SELECT DB_NAME() AS database_name, OBJECT_NAME(object_id) AS table_name,
+       is_filetable, filename_collation_name, directory_name
+FROM sys.filetables;'
+FROM sys.databases WHERE state_desc = 'ONLINE' AND database_id > 4;
+EXEC sp_executesql @sql;
+```
+
+### 9.8 Policy-Based Management
+
+```sql
+SELECT * FROM msdb.dbo.syspolicy_policies;
+SELECT * FROM msdb.dbo.syspolicy_conditions;
+SELECT * FROM msdb.dbo.syspolicy_object_sets;
+```
+
+---
+
+## 10. PRE-MIGRATION: performance baseline
+
+You want this so that post-migration "is it slower?" complaints have a baseline to compare against.
+
+### 10.1 Wait stats snapshot
+
+```sql
+-- Filtered to ignore benign waits; capture as baseline
+SELECT
+    wait_type,
+    waiting_tasks_count,
+    wait_time_ms,
+    wait_time_ms - signal_wait_time_ms AS resource_wait_ms,
+    signal_wait_time_ms,
+    max_wait_time_ms,
+    CAST(wait_time_ms * 100.0 / NULLIF(SUM(wait_time_ms) OVER (), 0) AS DECIMAL(5,2)) AS pct_of_total
+FROM sys.dm_os_wait_stats
+WHERE wait_type NOT IN (
+    'BROKER_EVENTHANDLER','BROKER_RECEIVE_WAITFOR','BROKER_TASK_STOP','BROKER_TO_FLUSH','BROKER_TRANSMITTER',
+    'CHECKPOINT_QUEUE','CHKPT','CLR_AUTO_EVENT','CLR_MANUAL_EVENT','CLR_SEMAPHORE','DBMIRROR_DBM_EVENT',
+    'DBMIRROR_EVENTS_QUEUE','DBMIRROR_WORKER_QUEUE','DBMIRRORING_CMD','DIRTY_PAGE_POLL',
+    'DISPATCHER_QUEUE_SEMAPHORE','EXECSYNC','FSAGENT','FT_IFTS_SCHEDULER_IDLE_WAIT','FT_IFTSHC_MUTEX',
+    'HADR_CLUSAPI_CALL','HADR_FILESTREAM_IOMGR_IOCOMPLETION','HADR_LOGCAPTURE_WAIT','HADR_NOTIFICATION_DEQUEUE',
+    'HADR_TIMER_TASK','HADR_WORK_QUEUE','KSOURCE_WAKEUP','LAZYWRITER_SLEEP','LOGMGR_QUEUE','MEMORY_ALLOCATION_EXT',
+    'ONDEMAND_TASK_QUEUE','PARALLEL_REDO_WORKER_WAIT_WORK','PREEMPTIVE_HADR_LEASE_MECHANISM',
+    'PREEMPTIVE_SP_SERVER_DIAGNOSTICS','PREEMPTIVE_OS_LIBRARYOPS','PWAIT_ALL_COMPONENTS_INITIALIZED',
+    'PWAIT_DIRECTLOGCONSUMER_GETNEXT','QDS_PERSIST_TASK_MAIN_LOOP_SLEEP','QDS_ASYNC_QUEUE',
+    'QDS_CLEANUP_STALE_QUERIES_TASK_MAIN_LOOP_SLEEP','QDS_SHUTDOWN_QUEUE','REDO_THREAD_PENDING_WORK',
+    'REQUEST_FOR_DEADLOCK_SEARCH','RESOURCE_QUEUE','SERVER_IDLE_CHECK','SLEEP_BPOOL_FLUSH','SLEEP_DBSTARTUP',
+    'SLEEP_DCOMSTARTUP','SLEEP_MASTERDBREADY','SLEEP_MASTERMDREADY','SLEEP_MASTERUPGRADED','SLEEP_MSDBSTARTUP',
+    'SLEEP_SYSTEMTASK','SLEEP_TASK','SLEEP_TEMPDBSTARTUP','SNI_HTTP_ACCEPT','SOS_WORK_DISPATCHER',
+    'SP_SERVER_DIAGNOSTICS_SLEEP','SQLTRACE_BUFFER_FLUSH','SQLTRACE_INCREMENTAL_FLUSH_SLEEP','SQLTRACE_WAIT_ENTRIES',
+    'WAIT_FOR_RESULTS','WAITFOR','WAITFOR_TASKSHUTDOWN','WAIT_XTP_HOST_WAIT','WAIT_XTP_OFFLINE_CKPT_NEW_LOG',
+    'WAIT_XTP_CKPT_CLOSE','WAIT_XTP_RECOVERY','XE_BUFFERMGR_ALLPROCESSED_EVENT','XE_DISPATCHER_JOIN',
+    'XE_DISPATCHER_WAIT','XE_LIVE_TARGET_TVF','XE_TIMER_EVENT'
+)
+AND wait_time_ms > 0
+ORDER BY wait_time_ms DESC;
+```
+
+Save the output. After migration, re-run after a representative workload window (a week is ideal, a day is workable) and compare top waits.
+
+### 10.2 Top queries by total CPU / IO / duration
+
+```sql
+SELECT TOP 50
+    qs.execution_count,
+    qs.total_worker_time / 1000        AS total_cpu_ms,
+    qs.total_worker_time / qs.execution_count / 1000 AS avg_cpu_ms,
+    qs.total_elapsed_time / 1000       AS total_elapsed_ms,
+    qs.total_logical_reads,
+    qs.total_logical_writes,
+    qs.total_physical_reads,
+    qs.last_execution_time,
+    DB_NAME(qt.dbid)                   AS database_name,
+    OBJECT_NAME(qt.objectid, qt.dbid)  AS object_name,
+    SUBSTRING(qt.text, qs.statement_start_offset / 2 + 1,
+        (CASE WHEN qs.statement_end_offset = -1 THEN DATALENGTH(qt.text)
+              ELSE qs.statement_end_offset END - qs.statement_start_offset) / 2 + 1) AS statement_text
+FROM sys.dm_exec_query_stats qs
+CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) qt
+ORDER BY qs.total_worker_time DESC;
+```
+
+Run three versions: `ORDER BY total_worker_time DESC`, `ORDER BY total_logical_reads DESC`, `ORDER BY total_elapsed_time / NULLIF(execution_count,0) DESC`. Save each.
+
+### 10.3 Index usage stats
+
+```sql
+DECLARE @sql NVARCHAR(MAX) = N'';
+SELECT @sql = @sql + N'
+USE ' + QUOTENAME(name) + N';
+SELECT
+    DB_NAME() AS database_name,
+    OBJECT_SCHEMA_NAME(i.object_id) + ''.'' + OBJECT_NAME(i.object_id) AS table_name,
+    i.name AS index_name, i.type_desc,
+    ius.user_seeks, ius.user_scans, ius.user_lookups, ius.user_updates,
+    ius.last_user_seek, ius.last_user_scan, ius.last_user_lookup, ius.last_user_update
+FROM sys.indexes i
+LEFT JOIN sys.dm_db_index_usage_stats ius
+    ON ius.object_id = i.object_id AND ius.index_id = i.index_id AND ius.database_id = DB_ID()
+WHERE i.object_id > 100 AND i.index_id > 0;'
+FROM sys.databases WHERE state_desc = 'ONLINE' AND database_id > 4;
+EXEC sp_executesql @sql;
+```
+
+Note: `sys.dm_db_index_usage_stats` resets on instance restart. The post-migration version will be near-empty; use it for *future* comparisons rather than direct diff.
+
+### 10.4 Memory and cache health
+
+```sql
+-- Buffer pool by database
+SELECT
+    CASE database_id WHEN 32767 THEN 'ResourceDB' ELSE DB_NAME(database_id) END AS database_name,
+    COUNT(*) * 8 / 1024 AS buffer_mb
+FROM sys.dm_os_buffer_descriptors
+GROUP BY database_id
+ORDER BY buffer_mb DESC;
+
+-- PLE
+SELECT @@SERVERNAME AS server_name,
+       cntr_value AS page_life_expectancy
+FROM sys.dm_os_performance_counters
+WHERE counter_name = 'Page life expectancy'
+  AND object_name LIKE '%Buffer Manager%';
+
+-- Memory clerks
+SELECT TOP 20
+    type,
+    SUM(pages_kb) / 1024 AS pages_mb
+FROM sys.dm_os_memory_clerks
+GROUP BY type
+ORDER BY pages_mb DESC;
+```
+
+### 10.5 Connection / login auditing
+
+If you're not already capturing who connects, do so for at least a week pre-migration. An Extended Events session:
+
+```sql
+CREATE EVENT SESSION [LoginAudit] ON SERVER
+ADD EVENT sqlserver.login (
+    ACTION (
+        sqlserver.client_app_name,
+        sqlserver.client_hostname,
+        sqlserver.database_name,
+        sqlserver.nt_username,
+        sqlserver.server_principal_name,
+        sqlserver.session_id
+    )
+    WHERE [package0].[equal_boolean]([sqlserver].[is_system], 0)
+)
+ADD TARGET package0.event_file (
+    SET filename = N'C:\XEvents\LoginAudit.xel',
+        max_file_size = 100,
+        max_rollover_files = 10
+);
+ALTER EVENT SESSION [LoginAudit] ON SERVER STATE = START;
+```
+
+Query later:
+
+```sql
+SELECT
+    object_name AS event,
+    CAST(event_data AS XML).value('(/event/@timestamp)[1]', 'datetime2') AS event_time,
+    CAST(event_data AS XML).value('(/event/action[@name="server_principal_name"]/value)[1]', 'sysname') AS principal,
+    CAST(event_data AS XML).value('(/event/action[@name="client_hostname"]/value)[1]', 'sysname') AS host,
+    CAST(event_data AS XML).value('(/event/action[@name="client_app_name"]/value)[1]', 'nvarchar(256)') AS app,
+    CAST(event_data AS XML).value('(/event/action[@name="database_name"]/value)[1]', 'sysname') AS database_name
+FROM sys.fn_xe_file_target_read_file('C:\XEvents\LoginAudit*.xel', NULL, NULL, NULL);
+```
+
+This tells you what applications you'll need to retest and reconfigure connection strings for.
+
+---
+
+## 11. PRE-MIGRATION: OS and external
+
+### 11.1 Disks and free space (PowerShell)
+
+```powershell
+Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DriveType=3" |
+    Select-Object DeviceID, VolumeName, FileSystem,
+        @{n='Size_GB';   e={[math]::Round($_.Size       /1GB,2)}},
+        @{n='Free_GB';   e={[math]::Round($_.FreeSpace  /1GB,2)}},
+        @{n='Free_Pct';  e={[math]::Round($_.FreeSpace*100/$_.Size,1)}} |
+    Format-Table -AutoSize
+```
+
+### 11.2 NTFS allocation unit size (should be 64 KB for SQL data drives)
+
+```powershell
+Get-CimInstance -ClassName Win32_Volume -Filter "DriveType=3" |
+    Select-Object DriveLetter, Label, BlockSize, FileSystem |
+    Format-Table -AutoSize
+```
+
+### 11.3 SPNs (Kerberos)
+
+```cmd
+setspn -L <service-account>
+```
+
+### 11.4 SQL Server network configuration
+
+```powershell
+# Listening port — from registry
+$Instance = 'MSSQLSERVER'
+Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\$Instance\MSSQLServer\SuperSocketNetLib\Tcp\IPAll"
+```
+
+### 11.5 Windows firewall rules
+
+```powershell
+Get-NetFirewallRule -DisplayName "*SQL*" |
+    Select-Object DisplayName, Enabled, Direction, Action, Profile
+```
+
+---
+
+## 12. Cutover-day actions
+
+For migration to a new instance (replace with appropriate steps for in-place upgrade):
+
+1. **Final pre-cutover CHECKDB** on every user database.
+2. **Stop application services** writing to source.
+3. **Disable Agent jobs** (or stop Agent service): `EXEC msdb.dbo.sp_update_job @job_name = N'...', @enabled = 0;` for each.
+4. **Set databases to read-only / single-user / take tail-log backups** depending on chosen method.
+5. **Take a final FULL backup** (or tail-log if doing log-shipping cutover) with `COPY_ONLY` if backups are normally going elsewhere.
+6. **Restore on target** with `MOVE` clauses for files.
+7. **Apply pre-staged objects**: logins, jobs, linked servers, credentials, certificates (TDE certs *before* restoring TDE-protected DBs).
+8. **Fix orphaned users** (script in §13.4).
+9. **Re-enable Service Broker** with appropriate option (`ENABLE_BROKER` vs `NEW_BROKER` vs `ERROR_BROKER_CONVERSATIONS`).
+10. **Update statistics with FULLSCAN** on user databases (especially after version upgrade).
+11. **Run DBCC UPDATEUSAGE** on each restored database.
+12. **Run DBCC CHECKDB WITH DATA_PURITY** on each database (forces purity check that may not have been done on older DBs).
+13. **Refresh views**: `sp_refreshview` for each non-schemabound view.
+14. **Re-enable Agent jobs**.
+15. **Run post-migration capture** (re-run the §4–§11 scripts).
+16. **Application smoke tests**.
+17. **Take a FULL backup** to re-baseline the backup chain.
+
+---
+
+## 13. POST-MIGRATION verification
+
+Re-run all the capture scripts in §4–§11 against the target and diff against the source captures. Specific checks that warrant their own script:
+
+### 13.1 Version and edition match expectations
+
+```sql
+SELECT @@VERSION, SERVERPROPERTY('Edition'), SERVERPROPERTY('ProductLevel'), SERVERPROPERTY('ProductUpdateLevel');
+```
+
+### 13.2 Database count and state
+
+```sql
+SELECT name, state_desc, recovery_model_desc, compatibility_level, collation_name
+FROM sys.databases
+ORDER BY name;
+```
+
+Diff against pre-migration list. Expected differences: `model`, `msdb`, `master` may differ in compat level if you've upgraded.
+
+### 13.3 Login SID parity (catches the #1 migration bug)
+
+Run this query on both source and target, then diff:
+
+```sql
+SELECT
+    name,
+    CONVERT(VARCHAR(MAX), sid, 1) AS sid_hex,
+    type_desc, is_disabled, default_database_name
+FROM sys.server_principals
+WHERE type IN ('S','U','G')
+  AND name NOT LIKE '##%'
+ORDER BY name;
+```
+
+Any login on source whose SID doesn't match target = guaranteed orphaned users in any DB where that login owns objects or has database users.
+
+### 13.4 Find and fix orphaned users
+
+```sql
+DECLARE @sql NVARCHAR(MAX) = N'';
+SELECT @sql = @sql + N'
+USE ' + QUOTENAME(name) + N';
+SELECT DB_NAME() AS database_name, dp.name AS user_name,
+       CONVERT(VARCHAR(MAX), dp.sid, 1) AS sid_hex, dp.type_desc
+FROM sys.database_principals dp
+LEFT JOIN sys.server_principals sp ON dp.sid = sp.sid
+WHERE dp.type IN (''S'',''U'') AND sp.sid IS NULL
+  AND dp.principal_id > 4;'
+FROM sys.databases WHERE state_desc = 'ONLINE' AND database_id > 4;
+EXEC sp_executesql @sql;
+```
+
+Fix by re-creating the login with matching SID (preferred — preserves permissions), or by remapping:
+
+```sql
+-- Per orphaned user, after the login is in place:
+USE <database>;
+ALTER USER <user_name> WITH LOGIN = <login_name>;
+```
+
+If you preserved SIDs in §6.1 and §13.3 is clean, you shouldn't have any of these.
+
+### 13.5 Compatibility level decision
+
+Default: keep the same compat level as source after upgrading the instance. To bump later, do so per database after performance testing.
+
+```sql
+-- Example: bump to 160 (SQL Server 2022)
+ALTER DATABASE <name> SET COMPATIBILITY_LEVEL = 160;
+```
+
+Safety net if you bump and see regressions:
+
+```sql
+-- Force legacy cardinality estimator at db scope
+ALTER DATABASE SCOPED CONFIGURATION SET LEGACY_CARDINALITY_ESTIMATION = ON;
+-- Or use Query Store to force a previously good plan
+```
+
+### 13.6 Update statistics with FULLSCAN
+
+```sql
+DECLARE @sql NVARCHAR(MAX) = N'';
+SELECT @sql = @sql + N'
+USE ' + QUOTENAME(name) + N';
+EXEC sp_updatestats;'  -- or per-table sp_updatestats / UPDATE STATISTICS ... WITH FULLSCAN
+FROM sys.databases WHERE state_desc = 'ONLINE' AND database_id > 4;
+EXEC sp_executesql @sql;
+```
+
+For thorough refresh (slower, IO-heavy):
+
+```sql
+-- Better: FULLSCAN, all stats
+DECLARE @db SYSNAME, @sql NVARCHAR(MAX);
+DECLARE c CURSOR LOCAL FAST_FORWARD FOR
+    SELECT name FROM sys.databases WHERE state_desc = 'ONLINE' AND database_id > 4;
+OPEN c; FETCH NEXT FROM c INTO @db;
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    SET @sql = N'USE ' + QUOTENAME(@db) + N';
+    DECLARE @t SYSNAME, @s NVARCHAR(MAX);
+    DECLARE tc CURSOR LOCAL FAST_FORWARD FOR
+        SELECT QUOTENAME(SCHEMA_NAME(schema_id)) + ''.'' + QUOTENAME(name)
+        FROM sys.tables;
+    OPEN tc; FETCH NEXT FROM tc INTO @t;
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        SET @s = N''UPDATE STATISTICS '' + @t + N'' WITH FULLSCAN;'';
+        EXEC sp_executesql @s;
+        FETCH NEXT FROM tc INTO @t;
+    END
+    CLOSE tc; DEALLOCATE tc;';
+    EXEC sp_executesql @sql;
+    FETCH NEXT FROM c INTO @db;
+END
+CLOSE c; DEALLOCATE c;
+```
+
+### 13.7 DBCC UPDATEUSAGE
+
+```sql
+DECLARE @sql NVARCHAR(MAX) = N'';
+SELECT @sql = @sql + N'DBCC UPDATEUSAGE(' + QUOTENAME(name) + N') WITH NO_INFOMSGS;
+' FROM sys.databases WHERE state_desc = 'ONLINE' AND database_id > 4;
+EXEC sp_executesql @sql;
+```
+
+### 13.8 DBCC CHECKDB WITH DATA_PURITY
+
+```sql
+DECLARE @sql NVARCHAR(MAX) = N'';
+SELECT @sql = @sql + N'DBCC CHECKDB(' + QUOTENAME(name) + N') WITH DATA_PURITY, NO_INFOMSGS;
+' FROM sys.databases WHERE state_desc = 'ONLINE' AND database_id > 4;
+EXEC sp_executesql @sql;
+```
+
+For databases that originated on SQL 2005+ this is implicit. For older heritage databases, this catches stored values that are out of range for their declared types — a class of issue that older versions silently tolerated.
+
+### 13.9 sp_refreshview for non-schemabound views
+
+```sql
+DECLARE @sql NVARCHAR(MAX) = N'';
+SELECT @sql = @sql + N'
+USE ' + QUOTENAME(name) + N';
+DECLARE @v SYSNAME, @s NVARCHAR(MAX);
+DECLARE vc CURSOR LOCAL FAST_FORWARD FOR
+    SELECT QUOTENAME(SCHEMA_NAME(schema_id)) + ''.'' + QUOTENAME(name)
+    FROM sys.views WHERE is_ms_shipped = 0
+      AND OBJECTPROPERTY(object_id, ''IsSchemaBound'') = 0;
+OPEN vc; FETCH NEXT FROM vc INTO @v;
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    BEGIN TRY EXEC sp_refreshview @v; END TRY
+    BEGIN CATCH PRINT ''Failed to refresh: '' + @v + '' - '' + ERROR_MESSAGE(); END CATCH
+    FETCH NEXT FROM vc INTO @v;
+END
+CLOSE vc; DEALLOCATE vc;'
+FROM sys.databases WHERE state_desc = 'ONLINE' AND database_id > 4;
+EXEC sp_executesql @sql;
+```
+
+### 13.10 Verify Agent jobs are enabled and have run
+
+```sql
+SELECT
+    j.name,
+    j.enabled,
+    SUSER_SNAME(j.owner_sid) AS owner,
+    (SELECT MAX(run_status_desc)
+     FROM (SELECT TOP 1 CASE jh.run_status
+                       WHEN 0 THEN 'Failed'
+                       WHEN 1 THEN 'Succeeded'
+                       WHEN 2 THEN 'Retry'
+                       WHEN 3 THEN 'Cancelled'
+                       WHEN 4 THEN 'In progress' END AS run_status_desc
+           FROM msdb.dbo.sysjobhistory jh
+           WHERE jh.job_id = j.job_id AND jh.step_id = 0
+           ORDER BY jh.run_date DESC, jh.run_time DESC) x) AS last_outcome
+FROM msdb.dbo.sysjobs j
+ORDER BY j.name;
+```
+
+Owner check: any job owned by a domain account that doesn't exist on the new server context will silently misbehave. Re-own to `sa` or to a known service principal.
+
+```sql
+EXEC msdb.dbo.sp_update_job @job_name = N'...', @owner_login_name = N'sa';
+```
+
+### 13.11 Backups: take a fresh full and verify the chain
+
+```sql
+-- For each user database
+BACKUP DATABASE <name>
+TO DISK = N'<path>\<name>_postmigration_full.bak'
+WITH COMPRESSION, CHECKSUM, INIT, STATS = 10;
+```
+
+Then verify your scheduled backups actually run on the new instance — don't assume.
+
+### 13.12 Always On health post-migration / post-failover
+
+```sql
+-- Reuse §8.1 queries, plus:
+SELECT * FROM sys.dm_hadr_cluster;
+SELECT * FROM sys.dm_hadr_cluster_members;
+SELECT * FROM sys.dm_hadr_cluster_networks;
+
+-- Latency snapshot
+SELECT
+    DB_NAME(database_id) AS db,
+    ar.replica_server_name,
+    drs.log_send_queue_size,
+    drs.log_send_rate,
+    drs.redo_queue_size,
+    drs.redo_rate,
+    DATEDIFF(SECOND, drs.last_hardened_time, GETDATE()) AS seconds_since_last_hardened
+FROM sys.dm_hadr_database_replica_states drs
+JOIN sys.availability_replicas ar ON drs.replica_id = ar.replica_id;
+```
+
+### 13.13 Application smoke tests
+
+Out of scope for SQL scripts, but at minimum:
+
+- One write/read from each major application.
+- Confirm test mail is received.
+- Confirm a scheduled report runs.
+- Confirm a linked server query returns rows.
+- Confirm AG failover (if applicable) completes inside RTO target.
+
+### 13.14 Performance baseline reset
+
+```sql
+-- Reset wait stats so post-migration baseline starts clean
+DBCC SQLPERF('sys.dm_os_wait_stats', CLEAR);
+
+-- Reset latch and spinlock stats too
+DBCC SQLPERF('sys.dm_os_latch_stats', CLEAR);
+DBCC SQLPERF('sys.dm_os_spinlock_stats', CLEAR);
+```
+
+After a representative workload window, re-run §10 and compare against the pre-migration capture.
+
+If using Query Store, consider purging history captured during cutover:
+
+```sql
+ALTER DATABASE <name> SET QUERY_STORE CLEAR;
+```
+
+Or leave it — pre/post comparison in Query Store reports is genuinely useful.
+
+---
+
+## 14. Reconciliation: what to diff
+
+Once you have source and target captures, the ones that *must* reconcile:
+
+| Capture | Tolerance |
+|---|---|
+| Logins (name + SID + hash) | Zero diff |
+| Database list + compat level + recovery model | Zero diff (except deliberate changes) |
+| Server role memberships | Zero diff |
+| Database users + SID | Zero diff |
+| Database role memberships | Zero diff |
+| Database-level permissions | Zero diff |
+| Agent jobs (name, owner, enabled, steps, schedules) | Zero diff |
+| Linked servers (definition + linked logins) | Zero diff (passwords need re-supply) |
+| Trace flags + startup parameters | Zero diff (re-apply on new instance) |
+| sp_configure values | Match by intention; some defaults change between versions |
+| Database file count, sizes, growth | Allowed to differ if intentional |
+| TDE state per database | Zero diff |
+
+Diffs are easiest in PowerShell:
+
+```powershell
+$src = Import-Csv "C:\Migration\source\logins.csv"
+$tgt = Import-Csv "C:\Migration\target\logins.csv"
+Compare-Object $src $tgt -Property name, sid_hex, type_desc
+```
+
+Or feed both into the same temp table on a third instance and do `EXCEPT` / `INTERSECT` queries — gives you symmetric diffs cleanly.
+
+---
+
+## 15. Rollback considerations
+
+Before cutover, decide and document:
+
+- **Rollback trigger.** What specifically constitutes "abort, go back"? Application smoke test failure, data inconsistency, performance regression beyond X%, missing object, security mismatch?
+- **Rollback method.**
+  - For migrations: source instance still exists and is read-only/offline. To rollback, point connection strings/aliases/listeners back and re-enable Agent. Any writes that happened on the target are lost unless you have a write-replay strategy.
+  - For in-place upgrades: there is no rollback. You restore from backup to a parallel instance. Plan capacity for this and test the restore time before cutover day.
+- **Time budget.** Define a hard stop. If you're not green by hour N, you rollback and try another weekend. Don't drift into Monday-morning chaos.
+- **Communication plan.** Who decides rollback? Who tells applications? Who confirms applications are healthy after rollback?
+
+---
+
+## 16. Quick reference: dbatools one-liners for the same workflow
+
+If module installation is allowed, these condense most of the above. Always check parameter help first.
+
+```powershell
+# Install if needed
+Install-Module dbatools -Scope CurrentUser
+
+# Full instance export to a folder
+Export-DbaInstance -SqlInstance SOURCE -Path C:\Migration\source
+
+# Pre-migration health
+Test-DbaMigrationConstraint -Source SOURCE -Destination TARGET
+
+# Specific copies
+Copy-DbaLogin            -Source SOURCE -Destination TARGET
+Copy-DbaAgentJob         -Source SOURCE -Destination TARGET
+Copy-DbaLinkedServer     -Source SOURCE -Destination TARGET
+Copy-DbaCredential       -Source SOURCE -Destination TARGET
+Copy-DbaDbMail           -Source SOURCE -Destination TARGET
+Copy-DbaResourceGovernor -Source SOURCE -Destination TARGET
+Copy-DbaSysDbUserObject  -Source SOURCE -Destination TARGET
+Copy-DbaCustomError      -Source SOURCE -Destination TARGET
+Copy-DbaServerAudit      -Source SOURCE -Destination TARGET
+
+# Restore + fix orphans
+Restore-DbaDatabase -SqlInstance TARGET -Path \\backup\share\db.bak
+Repair-DbaDbOrphanUser -SqlInstance TARGET -Database <db>
+
+# Post-migration sanity
+Get-DbaDbCompatibility   -SqlInstance TARGET
+Invoke-DbaQuery -SqlInstance TARGET -Query "DBCC CHECKDB WITH DATA_PURITY, NO_INFOMSGS" -Database <db>
+```
+
+dbatools is BSD-licensed, open source, and widely used in production. It's still your responsibility to read what each cmdlet does.
+
+---
+
+## 17. Final pre-cutover sanity check
+
+Before you start the cutover, ask yourself:
+
+1. Do I have a backup of every TDE certificate and the password?
+2. Do I have a restore-from-scratch plan if the target is corrupted by the migration itself?
+3. Have I tested the target storage IO performance against the source baseline?
+4. Have I tested at least one full failover/cutover dress rehearsal?
+5. Do all applications have a tested rollback path?
+6. Have I told stakeholders the maintenance window — and the rollback decision time?
+7. Is the source instance going to stay reachable for at least N days after cutover so I can answer "wait, what was X set to before?" questions?
+
+If any answer is no, go back. The migration will still be there next week.
