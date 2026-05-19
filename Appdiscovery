@@ -1,0 +1,65 @@
+Here’s a pre-upgrade checklist for enterprise apps. Adapt the depth to each application’s criticality.
+1. Inventory & scope
+	•	Current version, edition, patch/CU level for every app
+	•	Vendor support status (in-support, EOL, extended support)
+	•	Upgrade path (direct vs stepped — many products force interim versions)
+	•	Owners, stakeholders, and business criticality tier per app
+	•	Dependency map: upstream feeders, downstream consumers, shared services
+2. Compatibility matrix
+	•	OS version (current + target) — check vendor’s supported matrix, not just “it runs”
+	•	Database engine and edition (e.g. SQL Server version, compat level, collation)
+	•	Runtimes: .NET, Java JDK, Python, Node — exact versions
+	•	Middleware: IIS, web servers, message brokers, identity providers (ADFS/Entra)
+	•	Client/browser support if web-based
+	•	Integration partners’ API/contract versions
+	•	Licensing model changes (per-core vs per-user, subscription shifts)
+3. Release intelligence
+	•	Read full release notes between current → target version (not just latest)
+	•	Catalog breaking changes, deprecated features, removed APIs
+	•	Known issues / open bugs against target version
+	•	Required prerequisite patches on OS/DB before upgrade
+4. Backups & rollback
+	•	Full DB backup + verified restore test
+	•	App config, certificates, keys, service account credentials exported
+	•	VM snapshots or image-level backup where applicable
+	•	Documented, tested rollback procedure (untested = doesn’t exist)
+	•	Rollback decision criteria and time budget defined
+5. Environment & data
+	•	Dev/test/UAT/prod parity confirmed
+	•	Baseline captured: performance metrics, query plans, response times, resource use
+	•	Storage headroom on data, log, tempdb, backup volumes
+	•	HA/DR implications — for SQL Server AGs: secondary upgrade order, listener behaviour, quorum
+	•	Certificate expiry dates checked (upgrades often surface latent cert issues)
+6. Security & compliance
+	•	Service accounts: permissions still valid post-upgrade, no deprecated auth modes
+	•	TLS/cipher requirements of new version
+	•	Audit logging continuity (schema changes can break SIEM ingestion)
+	•	Compliance impact: GDPR, ISO 27001, PCI, SOC2 — re-attestation needed?
+	•	Penetration test / vulnerability scan on target version
+	•	Data residency unchanged
+7. Testing plan
+	•	Smoke test scripts ready
+	•	Regression suite covering critical paths
+	•	Integration tests with every upstream/downstream system
+	•	Performance test against captured baseline
+	•	UAT signoff criteria and test users provisioned
+	•	Failover/failback test for HA configurations
+8. Operational readiness
+	•	Maintenance window agreed, CAB approval secured
+	•	Runbooks updated with exact commands and expected outputs
+	•	Monitoring thresholds reviewed (new version may have different normal)
+	•	Alerting paths tested
+	•	Support team briefed on changes and known issues
+	•	Vendor support case opened proactively for high-risk upgrades
+9. Communications
+	•	Downtime notification sent (with timing buffer)
+	•	Status page / comms channel during the change
+	•	Escalation contacts (internal + vendor) on standby
+	•	Post-upgrade announcement template ready
+10. Post-upgrade verification
+	•	Smoke + critical-path tests pass
+	•	Performance within X% of baseline (define X up front)
+	•	Error logs reviewed for new warnings/errors
+	•	Backups taken and verified on upgraded system
+	•	Monitoring confirms stable for N hours before sign-off
+	•	Documentation, CMDB, and architecture diagrams updated.​​​​​​​​​​​​​​​​
