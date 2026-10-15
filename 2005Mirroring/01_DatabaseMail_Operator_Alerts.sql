@@ -48,6 +48,16 @@ SET @OperatorEmail = N'dba-team@yourdomain.local';        -- <<< change (; separ
 EXEC sp_configure 'show advanced options', 1; RECONFIGURE;
 EXEC sp_configure 'Database Mail XPs', 1;     RECONFIGURE;
 
+/* Database Mail rides on Service Broker in msdb. If it is off, mail just sits
+   in the queue as 'unsent' with no error anywhere - including every alert
+   these scripts set up. Enabling it needs SQL Agent stopped (exclusive
+   access to msdb):  ALTER DATABASE msdb SET ENABLE_BROKER; */
+IF (SELECT is_broker_enabled FROM sys.databases WHERE name = N'msdb') = 0
+BEGIN
+    RAISERROR('Service Broker is DISABLED in msdb - Database Mail will queue but never send. Stop SQL Agent, run ALTER DATABASE msdb SET ENABLE_BROKER; start Agent, then re-run this script.', 16, 1);
+    RETURN;
+END
+
 /* 2. Account + profile */
 IF NOT EXISTS (SELECT * FROM msdb.dbo.sysmail_account WHERE name = @AccountName)
     EXEC msdb.dbo.sysmail_add_account_sp
